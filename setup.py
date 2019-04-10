@@ -19,6 +19,7 @@ setup(
         'bokeh>=1.0.4',
         'pandas>=0.23.4',
         'seaborn>=0.9.0',
+        'python-magic>=0.4.15',
     ],
     zip_safe=False)
 
