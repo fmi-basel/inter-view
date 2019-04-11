@@ -3,4 +3,6 @@
 Interactive visualization of segmentation data
 
 ## Installation
-TODO
+```
+pip install --user -e inter_view/
+```
