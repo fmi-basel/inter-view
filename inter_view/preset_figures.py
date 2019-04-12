@@ -1,8 +1,7 @@
 import numpy as np
 import pandas as pd
 import os
-import magic
-import re
+import PIL.Image
 
 from skimage.io import imsave, imread
 
@@ -72,10 +71,8 @@ def update_color_mapping(source, hue):
 
 
 def read_image_size(path):
-    file_sig = magic.from_file(path)
-    width, height = re.search('(\d+) x (\d+)', file_sig).groups()
-    
-    return(int(width), int(height))
+    img = PIL.Image.open(path)
+    return img.size
 
 
 class TiledImages():
