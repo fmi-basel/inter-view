@@ -20,6 +20,7 @@ setup(
         'pandas>=0.23.4',
         'seaborn>=0.9.0',
         'Pillow>=6.0.0',
+        'opencv-python>=4.1'
     ],
     zip_safe=False)
 

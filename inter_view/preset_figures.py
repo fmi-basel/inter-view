@@ -16,6 +16,8 @@ from bokeh.layouts import gridplot, layout, row
 
 
 # TODO
+# set aspect ratio of all fig size (instead of max_d) --> see ImageStackWithSlider
+# move update_color_mapping, read_image size, etc. to new utils module
 # marginal plots: if hue is catgorical, plot kde with diferent colors
 # barplots of current hue count (category) or histogram (numeric)
 # outliers selection (when hue=outliers) + save_df
@@ -211,7 +213,6 @@ class ImageWithOverlay():
         self.p.select(WheelZoomTool).maintain_focus=False
         self.p.select(BoxSelectTool).select_every_mousemove = True
         self.p.select(LassoSelectTool).select_every_mousemove = True
-        self.p.select(WheelZoomTool).maintain_focus=False
         
         self.p.grid.visible = False
         self.p.background_fill_color = None
