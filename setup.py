@@ -6,7 +6,7 @@ contrib = [
 
 # setup.
 setup(name='inter_view',
-      version='0.2',
+      version='0.2.1',
       description=
       'Utils to interactively visualize pre-computed dataframe with bokeh',
       author=', '.join(contrib),
