@@ -2,6 +2,8 @@ import numpy as np
 import os
 import cv2 as cv
 
+from inter_view.utils import read_image_size
+
 from skimage.io import imsave, imread
 
 from bokeh.plotting import figure
