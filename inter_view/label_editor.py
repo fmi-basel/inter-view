@@ -1,486 +1,505 @@
 import numpy as np
-import cv2 as cv
+import os
+from glob import glob
 
-from bokeh.plotting import figure
-from bokeh.models import Range1d, WheelZoomTool
-from bokeh.models import FreehandDrawTool, PolyEditTool, PolyDrawTool, HoverTool
+from inter_view.utils import min_max_scaling
+
 from bokeh.models import ColumnDataSource
-from bokeh.models import CustomJS, Slider
-from bokeh.models import Span
-from bokeh.models.tools import HoverTool
-from bokeh.palettes import grey
-from bokeh.layouts import gridplot, layout, row, column, widgetbox
-from bokeh.events import Tap, DoubleTap, Press
-from bokeh.models.widgets import CheckboxButtonGroup, Toggle
+from bokeh.models.callbacks import CustomJS
+from bokeh.models.widgets import Select
+from bokeh.layouts import widgetbox, row
+from bokeh.models.widgets import RadioButtonGroup, Button, Toggle, CheckboxGroup
+from bokeh.models import Slider
+from bokeh.events import Tap
+
+from skimage.io import imread, imsave
+from skimage.segmentation import relabel_sequential
+
+from scipy.ndimage.filters import gaussian_filter
+from scipy.ndimage import label as ndimage_label
+from scipy.ndimage.morphology import distance_transform_edt
 
 
-class OrthoView():
-    '''create 3 figures with slider to view 3D image stack
-    '''
+class DataHandler:
+    '''maintains images list and loads and save them from/on disk'''
 
-    def __init__(self, config, **kwargs):
+    def __init__(self, base_dir, master_channel, config, n_images=10, seed=13):
 
-        self.top = ImageStackWithSlider(config, axis=0, **kwargs)
-        self.right = ImageStackWithSlider(config, axis=2, **kwargs)
-        self.front = ImageStackWithSlider(config, axis=1, **kwargs)
+        self.n_images = n_images
+        self.base_dir = base_dir
+        self.master = master_channel
+        self.channels = list(config.keys())
 
-        # sync axis and fix aspect ratio
-        self.right.p.y_range = self.top.p.y_range
-        self.front.p.x_range = self.top.p.x_range
+        self.paths = {}
+        self.preproc = {}
+        self.images = {}  # loaded images
+        self.sequential = {
+        }  # whether image contains labels that should remain sequential
 
-        # setup additional callback when sliders are moved
-        self.top.slider.on_change('value', self.update_top_slice)
-        self.right.slider.on_change('value', self.update_right_slice)
-        self.front.slider.on_change('value', self.update_front_slice)
+        for ch, val in config.items():
+            self.preproc[ch] = val.get('preproc', lambda x: x)
+            self.sequential[ch] = val.get('sequential', False)
 
-        # add callback to move slider to clicked
-        self.top.p.on_event(Tap, self.top_tap_callback)
-        self.right.p.on_event(Tap, self.right_tap_callback)
-        self.front.p.on_event(Tap, self.front_tap_callback)
+            self.paths[ch] = os.path.join(base_dir, val['path'])
+            if not os.path.exists(self.paths[ch]):
+                os.makedirs(self.paths[ch])
 
-        # add button to enable navigation
-        self.button_toggle_nav = Toggle(label='Navigation OFF', active=False)
-        self.button_toggle_nav.on_click(self.toggle_navigation)
+        self.filenames = glob(os.path.join(self.paths[self.master], '*.tif'))
+        self.filenames = sorted([os.path.basename(p) for p in self.filenames])
+        if n_images:
+            np.random.seed(seed)
+            np.random.shuffle(self.filenames)
+            self.filenames = self.filenames[0:n_images]
+            self.filenames.sort()
 
-        # add slices indicator lines
-        span_config = {
-            'line_dash': 'dashed',
-            'line_width': 2,
-            'line_color': 'white',
-            'line_alpha': 1.0
-        }
+        # ~ print(self.filenames)
 
-        self.top_vspan = Span(dimension='height',
-                              location=self.right.slice,
-                              **span_config)
-        self.top_hspan = Span(dimension='width',
-                              location=self.front.slice,
-                              **span_config)
-        self.right_vspan = Span(dimension='height',
-                                location=self.top.slice / self.right.xy_ratio,
-                                **span_config)
-        self.right_hspan = Span(dimension='width',
-                                location=self.front.slice,
-                                **span_config)
-        self.front_vspan = Span(dimension='height',
-                                location=self.right.slice,
-                                **span_config)
-        self.front_hspan = Span(dimension='width',
-                                location=self.top.slice / self.right.xy_ratio,
-                                **span_config)
+    def load_images(self, idx):
+        self.idx = idx
 
-        self.top.p.add_layout(self.top_vspan)
-        self.top.p.add_layout(self.top_hspan)
-        self.right.p.add_layout(self.right_vspan)
-        self.right.p.add_layout(self.right_hspan)
-        self.front.p.add_layout(self.front_vspan)
-        self.front.p.add_layout(self.front_hspan)
+        self.images[self.master] = imread(
+            os.path.join(self.paths[self.master], self.filenames[idx]))
+        self.images[self.master] = self.preproc[self.master](
+            self.images[self.master])
 
-        # add callback to keep images in sync
+        for c in self.channels:
+            if c != self.master:
+                try:
+                    self.images[c] = imread(
+                        os.path.join(self.paths[c], self.filenames[idx]))
+                except:
+                    # is image doesn't exist yet, initialize with same size as master with label=-1
+                    self.images[c] = np.zeros_like(self.images[self.master],
+                                                   dtype=np.int16) - 1
+                self.images[c] = self.preproc[c](self.images[c])
+
+            if self.sequential[c]:
+                self.relabel_sequential(c)
+
+    def save_channel(self, ch):
+        imsave(os.path.join(self.paths[ch], self.filenames[self.idx]),
+               self.images[ch])
+
+    def delete_val_from_channel(self, val, ch):
+        self.images[ch][self.images[ch] == val] = -1
+        if val > 0:  # label 0 reserved for background, even if not sequential, no need to relabel
+            self.relabel_sequential(ch)
+
+    def relabel_sequential(self, ch):
+        '''relable sequential, reserving -1,0 labels if not existing (separate current code in fct)'''
+
+        bg_unlabeled = False
+        if 0 not in self.images[ch]:
+            bg_unlabeled = True
+
+        self.images[ch][:], _, _ = relabel_sequential(self.images[ch] + 1)
+        self.images[ch] -= 1
+        if bg_unlabeled:  # 0 should remain unused
+            self.images[ch][self.images[ch] >= 0] += 1
+
+    def map_label(self, ch, ch_target):
+        '''maps ch labels to ch_target labels with largest overlap, assign 
+        new label when only overlapping with undefined areas'''
+
+        img = self.images[ch]
+        img_target = self.images[ch_target]
+
+        if img.max() >= 0:
+            lut = [-1] * (img.max() + 1)
+            extra_label_start = img_target.max() + 1
+            extra_label_count = 0
+
+            for img_label in np.unique(img):
+                img_target_labels, intersections = np.unique(
+                    img_target[img == img_label], return_counts=True)
+                if img_target_labels[0] == -1:
+                    img_target_labels = np.delete(img_target_labels, 0)
+                    intersections = np.delete(intersections, 0)
+
+                if img_target_labels.size > 0:
+                    lut[img_label] = img_target_labels[np.argmax(
+                        intersections)]
+                else:
+                    lut[img_label] = extra_label_start + extra_label_count
+                    extra_label_count += 1
+
+            print(lut)
+
+            # apply lut
+            lut = np.asarray(lut)
+            img[:] = lut[img]
+
+    def merge_channels(self, ch_primary, ch_secondary):
+        '''replace secondary channel by a composite: primary_ch where defined (i.e. >= 0), secondary elsewhere.'''
+
+        defined_idxs = self.images[ch_primary] >= 0
+        self.images[ch_secondary][defined_idxs] = self.images[ch_primary][
+            defined_idxs]
+
+
+# TODO
+# calc distance transform only in neighborhood of seed (defined by threhsold)
+# checkbox to auto increment label after 'apply'
+#    - set drawing color
+#   - add callback in global control (watch for inf loop): self.view.top.draw_r.glyph.on_change('line_color', cb)
+class MaskControls:
+    '''Widget layout and callbacks to show thresholded mask output and apply it on annotations'''
+
+    def __init__(self, datahandler, view, mask_channel, source_channel,
+                 drawing_channel):
+        self.datahandler = datahandler
+        self.view = view
+        self.ch = mask_channel
+        self.source_ch = source_channel
+        self.drawing_ch = drawing_channel
         self.update_in_progress = False
-        for channel in config.keys():
-            self.top.renderers[channel].data_source.on_change(
-                'data', self.update_image(channel, 'top'))
-            self.right.renderers[channel].data_source.on_change(
-                'data', self.update_image(channel, 'right'))
-            self.front.renderers[channel].data_source.on_change(
-                'data', self.update_image(channel, 'front'))
 
-        # build layout
-        self.plot()
+        self.button_toggle_seed = Toggle(label='seeded segmentation OFF',
+                                         active=False)
+        self.button_toggle_seed.on_click(self.toggle_seed)
 
-    def add_drawing_tools(self, drawing_channel):
-        self.drawing_channel = drawing_channel
-        self.top.add_drawing_tools(drawing_channel)
-        self.right.add_drawing_tools(drawing_channel)
-        self.front.add_drawing_tools(drawing_channel)
+        self.view.add_tap_callback(self.callback_set_seed_location)
+        self.seed_pos = (0, 0, 0)
 
-    def set_drawing_channel(self, drawing_channel):
-        self.drawing_channel = drawing_channel
-        self.top.set_drawing_channel(drawing_channel)
-        self.right.set_drawing_channel(drawing_channel)
-        self.front.set_drawing_channel(drawing_channel)
+        self.button_apply = Button(label="apply", button_type='primary')
+        self.button_apply.on_click(self.apply)
 
-    def set_drawing_color(self, color):
-        self.top.set_drawing_color(color)
-        self.front.set_drawing_color(color)
-        self.right.set_drawing_color(color)
+        # callback policy on apply to JS --> hacky workaround with fake datasource:
+        # https://stackoverflow.com/questions/38375961/throttling-in-bokeh-application/38379136#38379136
+        self.threshold_source = ColumnDataSource(data=dict(value=[1]))
+        self.threshold_source.on_change('data', self.callback_slider_threshold)
+        self.slider_theshold = Slider(title='threshold',
+                                      start=0,
+                                      end=1,
+                                      value=0.5,
+                                      step=0.001,
+                                      callback_policy='mouseup')
+        self.slider_theshold.callback = CustomJS(
+            args=dict(threshold_source=self.threshold_source),
+            code="""
+                threshold_source.data = { value: [cb_obj.value] }""")
 
-    def update_image(self, channel, view='top'):
-        '''Return callbacks to force update 2 views when one is modified (e.g. force update right and front when top changes)'''
+        # callback policy on apply to JS --> hacky workaround with fake datasource:
+        # https://stackoverflow.com/questions/38375961/throttling-in-bokeh-application/38379136#38379136
+        self.blur_source = ColumnDataSource(data=dict(value=[1]))
+        self.blur_source.on_change('data', self.callback_slider_blur)
+        self.slider_blur = Slider(title='blur',
+                                  start=0,
+                                  end=10,
+                                  value=0.2,
+                                  step=0.05,
+                                  callback_policy='mouseup')
+        self.slider_blur.callback = CustomJS(
+            args=dict(blur_source=self.blur_source),
+            code="""
+                blur_source.data = { value: [cb_obj.value] }""")
 
-        def propagate_update_image(attr, old, new):
-            if not self.update_in_progress:
-                self.update_in_progress = True
-                for imstack in {'top', 'right', 'front'} - {view}:
-                    getattr(self, imstack).force_update(channel)
+        # callback policy on apply to JS --> hacky workaround with fake datasource:
+        # https://stackoverflow.com/questions/38375961/throttling-in-bokeh-application/38379136#38379136
+        self.dist_reg_source = ColumnDataSource(data=dict(value=[1]))
+        self.dist_reg_source.on_change('data', self.callback_slider_dist_reg)
+        self.slider_dist_reg = Slider(title='distance regularizer',
+                                      start=0,
+                                      end=1,
+                                      value=0.,
+                                      step=0.01,
+                                      callback_policy='mouseup')
+        self.slider_dist_reg.callback = CustomJS(
+            args=dict(dist_reg_source=self.dist_reg_source),
+            code="""
+                dist_reg_source.data = { value: [cb_obj.value] }""")
 
-                self.update_in_progress = False
+        self.checkbox_invert = CheckboxGroup(labels=['invert'], active=[])
+        self.checkbox_invert.on_click(self.callback_checkbox_invert)
 
-        return propagate_update_image
+        self.checkbox_apply_params = CheckboxGroup(
+            labels=['whole stack', 'override'], active=[0])
 
-    def set_images(self, images):
-        self.top.set_images(images)
-        self.right.set_images(images)
-        self.front.set_images(images)
+        self.l = widgetbox([
+            self.button_toggle_seed,
+            row(self.checkbox_apply_params, self.button_apply, width=300),
+            self.slider_theshold,
+            self.checkbox_invert,
+            self.slider_blur,
+            self.slider_dist_reg,
+        ],
+                           width=300)
 
-        # override plot dimension to match main view
-        self.right.plot_height = self.top.plot_height
-        self.right.plot_width = int(self.right.plot_height * self.right.width /
-                                    self.right.height)
-        self.right.update_figure_geometry()
+        # init cached blurred image and update when source image changes
+        self.callback_update_image(None, None, None)
+        self.view.add_image_on_change_callback(self.source_ch,
+                                               self.callback_update_image)
 
-        self.front.plot_width = self.top.plot_width
-        self.front.plot_height = int(self.front.plot_width *
-                                     self.front.height / self.front.width)
-        self.front.update_figure_geometry()
+        # init distance to seed
+        self.dist_to_seed = np.zeros_like(self.blurred_img)
 
-    def update_figure_geometry(self):
-        self.top.update_figure_geometry()
-        self.right.update_figure_geometry()
-        self.front.update_figure_geometry()
+    def callback_update_image(self, attr, old, new):
+        if not self.view.update_in_progress:
+            self.callback_slider_blur(None, None, self.blur_source.data)
 
-    def set_toolsize(self, toolsize):
-        self.top.set_toolsize(toolsize)
-        self.front.set_toolsize(toolsize)
-        self.right.set_toolsize(toolsize)
-
-    def set_drawing_alpha(self, alpha):
-        self.top.set_drawing_alpha(alpha)
-        self.front.set_drawing_alpha(alpha)
-        self.right.set_drawing_alpha(alpha)
-
-    def toggle_navigation(self, state):
+    def toggle_seed(self, state):
         if state:
-            self.button_toggle_nav.label = 'Navigation ON'
+            self.button_toggle_seed.label = 'seeded segmentation ON'
         else:
-            self.button_toggle_nav.label = 'Navigation OFF'
+            self.button_toggle_seed.label = 'seeded segmentation OFF'
 
-    def top_tap_callback(self, event):
-        '''Moves right and front sliders to position clicked on top view'''
-        if self.button_toggle_nav.active:
-            self.right.slider.value = int(round(event.x - 0.5))
-            self.front.slider.value = int(round(event.y - 0.5))
+        self.update_segmentation()
 
-    def right_tap_callback(self, event):
-        '''Moves top and front sliders to position clicked on right view'''
-        if self.button_toggle_nav.active:
-            self.top.slider.value = int(
-                round(event.x * self.right.xy_ratio - 0.5))
-            self.front.slider.value = int(round(event.y - 0.5))
+    def apply(self):
+        '''Write current mask on drawing channel'''
 
-    def front_tap_callback(self, event):
-        '''Moves top and right sliders to position clicked on front view'''
-        if self.button_toggle_nav.active:
-            self.right.slider.value = int(round(event.x - 0.5))
-            self.top.slider.value = int(
-                round(event.y / self.front.xy_ratio - 0.5))
+        mask = self.mask.copy()
+        if 1 not in self.checkbox_apply_params.active:
+            #  don't ovverride existing annotations
+            mask[self.datahandler.images[self.drawing_ch] >= 0] = False
 
-    def update_top_slice(self, attr, old, new):
-        '''Update right and front views when top slider is moved'''
-        self.right_vspan.location = (new + 0.5) / self.right.xy_ratio
-        self.front_hspan.location = (new + 0.5) * self.front.xy_ratio
-
-    def update_right_slice(self, attr, old, new):
-        '''Update top and front views when right slider is moved'''
-        self.top_vspan.location = new + 0.5
-        self.front_vspan.location = new + 0.5
-
-    def update_front_slice(self, attr, old, new):
-        '''Update top and right views when front slider is moved'''
-        self.top_hspan.location = new + 0.5
-        self.right_hspan.location = new + 0.5
-
-    def plot(self):
-
-        self.controls = widgetbox([self.button_toggle_nav], width=600)
-        self.layout = gridplot([[self.top.layout, self.right.layout],
-                                [self.front.layout, self.controls]],
-                               merge_tools=False)
-
-
-class ImageStackWithSlider():
-    '''
-    '''
-
-    def __init__(self, config, sampling=1, axis=0, **kwargs):
-        '''Builds a figure with a slider to navigate trough image slices
-        '''
-
-        self.axis = axis
-        self.axis_mapping = [[0, 1, 2], [1, 0, 2], [2, 1, 0]]
-
-        # transpose and arrange images in column datasource (1 slice per column)
-        self.npimages = {}  # images as numpy array
-        self.data = {}  # images as dict with one item per slice
-        for key, val in config.items():
-
-            npimg = val.get('npimage',
-                            np.zeros((2, 16, 16), dtype=np.int16) - 1)
-            npimg = np.transpose(npimg, self.axis_mapping[axis])
-            npimg = npimg[:, ::
-                          -1]  # flip x axis to orient image following std convention (top,left) = (0,0)
-            self.data[key] = {
-                str(z): [npimg[z]]
-                for z in range(npimg.shape[0])
-            }
-            self.npimages[key] = npimg
-
-        self.sampling = np.broadcast_to(np.asarray(sampling), 3)
-        self.sampling = self.sampling[self.axis_mapping[axis]]
-
-        self.kwargs = kwargs
-
-        self.compute_figure_geometry(npimg.shape)
-
-        self.slice = self.n_slices // 2  # first show middle slice
-        self.x_range = Range1d(start=0, end=self.width, bounds=(0, self.width))
-        self.x_range.on_change('start', self.zoom_callback)
-        self.y_range = Range1d(start=self.height,
-                               end=0,
-                               bounds=(0, self.height))
-
-        self.slider = Slider(title='axis({})'.format(axis),
-                             start=0,
-                             end=self.n_slices - 1,
-                             value=self.slice,
-                             step=1)
-        self.slider.on_change('value', self.update_slice)
-
-        self.tooltips_formatting = [("(x,y)", "($x{0.}, $y{0.})"),
-                                    ('value', '@' + str(self.slice))]
-
-        self.plot(config)
-
-    def compute_figure_geometry(self, img_shape):
-
-        self.n_slices, self.height, self.width = img_shape[0:3]
-        self.xy_ratio = self.sampling[1] / self.sampling[2]
-        if self.xy_ratio < 1:
-            self.width /= self.xy_ratio
+        if 0 not in self.checkbox_apply_params.active:
+            # single slice
+            sl = self.view.get_zslice()
+            self.datahandler.images[self.drawing_ch][sl][
+                mask[sl]] = self.view.get_drawing_color()
         else:
-            self.height *= self.xy_ratio
+            self.datahandler.images[
+                self.drawing_ch][mask] = self.view.get_drawing_color()
 
-        if self.width / self.height > 1:
-            self.plot_width = 600
-            self.plot_height = int(600 * self.height / self.width)
+        self.view.force_update(self.drawing_ch)
+
+    def callback_slider_threshold(self, attr, old, new):
+        # ~ thresh = new['value'][0]
+        self.update_segmentation()
+
+    def callback_slider_dist_reg(self, attr, old, new):
+        # ~ thresh = new['value'][0]
+        self.update_segmentation()
+
+    def callback_slider_blur(self, attr, old, new):
+        sigma = self.slider_blur.value
+        sampling = self.view.get_sampling()
+
+        if sigma > 0:
+            self.blurred_img = gaussian_filter(
+                self.datahandler.images[self.source_ch],
+                sigma=sigma / sampling)
         else:
-            self.plot_width = int(600 * self.width / self.height)
-            self.plot_height = 600
+            self.blurred_img = self.datahandler.images[self.source_ch]
 
-    def set_images(self, images):
-        '''expects dict with same keys as in init'''
+        self.blurred_img = self.blurred_img.astype(np.float32)
+        self.blurred_img /= self.blurred_img.max()
+        self.update_segmentation()
 
-        for key, val in images.items():
+    def callback_checkbox_invert(self, active):
+        self.update_segmentation()
 
-            npimg = val
-            npimg = np.transpose(npimg, self.axis_mapping[self.axis])
-            npimg = npimg[:, ::
-                          -1]  # flip x axis to orient image following std convention (top,left) = (0,0)
-            self.data[key] = {
-                str(z): [npimg[z]]
-                for z in range(npimg.shape[0])
-            }
-            self.npimages[key] = npimg
-            self.force_update(key)
+    def callback_set_seed_location(self, event):
+        if self.button_toggle_seed.active:
+            z = self.view.get_zslice()
+            x = int(round(event.y))
+            y = int(round(event.x))
+            self.seed_pos = (z, x, y)
 
-        self.compute_figure_geometry(npimg.shape)
-        self.update_figure_geometry()
+            sampling = self.view.get_sampling()
+            sampling = sampling / sampling.min()
+            seed_mask = np.ones_like(self.blurred_img, dtype=bool)
+            seed_mask[self.seed_pos] = False
+            self.dist_to_seed = distance_transform_edt(seed_mask,
+                                                       sampling=sampling)
 
-    def force_update(self, channel):
-        '''hack to force bokeh update on client side: reassign datasource dict'''
-        self.renderers[channel].data_source.data = self.data[channel]
+            self.dist_to_seed = np.clip(self.dist_to_seed, 0.,
+                                        float(max(seed_mask.shape)))
+            self.dist_to_seed /= float(max(seed_mask.shape))
 
-    def update_figure_geometry(self):
+            self.update_segmentation()
 
-        # update figure
-        self.update_slice(None, None, self.n_slices // 2)
-        self.slider.end = self.n_slices - 1
-        self.slider.value = self.slice
-        self.x_range.start = 0
-        self.x_range.end = self.width
-        self.x_range.bounds = (0, self.width)
-        self.y_range.start = self.height
-        self.y_range.end = 0
-        self.y_range.bounds = (0, self.height)
-        self.p.plot_width = self.plot_width
-        self.p.plot_height = self.plot_height
-        # inconsistent names in bokeh: https://github.com/bokeh/bokeh/issues/4830 --> is plot_width deprecated?
-        self.p.width = self.plot_width
-        self.p.height = self.plot_height
+    def callback_update_segmentation(self, attr, old, new):
+        self.update_segmentation()
 
-        # update renderers
-        for val in self.renderers.values():
-            val.glyph.y = self.height
-            val.glyph.dw = self.width
-            val.glyph.dh = self.height
+    def update_segmentation(self):
+        '''Update seeded segmentation image'''
 
-        # update drawing glyph size
-        self.zoom_callback(None, None, None)
+        if self.update_in_progress == False:
+            self.update_in_progress = True
 
-    def update_slice(self, attr, old, new):
+            if self.checkbox_invert.active:  # dark object on white background
+                composite = 1. - self.blurred_img
+            else:
+                composite = self.blurred_img
 
-        self.slice = new
+            if self.button_toggle_seed.active and self.blurred_img.shape == self.dist_to_seed.shape:
+                composite = (1 - self.slider_dist_reg.value
+                             ) * composite + self.slider_dist_reg.value * (
+                                 1. - self.dist_to_seed)
 
-        # bug tooltips field not updating on server side (always point to the initial slice)
-        # adding a new tooltip works but how tho remvoe the old ones???
-        # self.tooltips_formatting[1] = ('value', '@' + str(self.slice))
-        # for t in self.p.select(HoverTool):
-        # t.tooltips = self.tooltips_formatting
+            self.mask = composite >= self.slider_theshold.value
 
-        for key, val in self.renderers.items():
-            val.glyph.image = str(self.slice)
+            if self.button_toggle_seed.active:
+                labels, _ = ndimage_label(self.mask)
+                seed_label = labels[self.seed_pos]
+                if seed_label > 0:
+                    self.mask = labels == seed_label
+                else:
+                    self.mask[:] = False
 
-    def plot(self, config):
+            self.datahandler.images[self.ch][:] = self.mask
+            self.view.force_update(self.ch)
+            self.update_in_progress = False
 
-        self.p = figure(
-            x_range=self.x_range,
-            y_range=self.y_range,
-            toolbar_location='above',
-            tools='wheel_zoom,pan,reset,tap',  #hover
-            # tooltips=self.tooltips_formatting,
-            plot_width=self.plot_width,
-            plot_height=self.plot_height,
-            active_scroll='wheel_zoom',
-            # ~ y_axis_location=None,
-            # ~ x_axis_location=None,
-        )
 
-        self.p.select(WheelZoomTool).maintain_focus = False
-        self.p.outline_line_color = None
-        self.p.grid.visible = False
-        self.p.background_fill_color = None
-        self.p.border_fill_color = None
+class Controls:
+    '''Widget layout and callbacks to draw on images'''
 
-        self.renderers = {}
-        for key, val in config.items():
+    def __init__(self, datahandler, view, drawing_channel):
+        self.datahandler = datahandler
+        self.view = view
+        self.drawing_ch = drawing_channel
+        self.view.add_drawing_tools(drawing_channel, self.callback_on_drawing)
 
-            self.renderers[key] = self.p.image(
-                image=str(self.slice),
-                source=ColumnDataSource(self.data[key]),
-                x=0,
-                y=self.height,
-                dw=self.width,
-                dh=self.height,
-                palette=val.get('palette', grey(256)),
-                global_alpha=val.get('alpha', 1.0),
-                legend=key,
-                name=key)
+        self.save_button = Button(label="Save annotations",
+                                  button_type='primary')
+        self.save_button.on_click(self.callback_save_button)
 
-            self.renderers[key].glyph.color_mapper.low = val.get('map_low', 0)
-            self.renderers[key].glyph.color_mapper.high = val.get(
-                'map_high', len(val.get('palette', grey(256))))
-            self.renderers[key].visible = val.get('visible', True)
+        self.discard_button = Button(label="Discard changes",
+                                     button_type='primary')
+        self.discard_button.on_click(self.callback_discard_button)
 
-        self.adjust_legend(self.p.legend)
-        # self.p.hover.point_policy = 'follow_mouse'
-        # self.p.hover.names = ['annotations'] # only show tooltips when hover patches
+        self.file_select = Select(
+            title="Save current and load new file",
+            value=str(datahandler.idx),
+            options=[(idx, fn)
+                     for idx, fn in enumerate(datahandler.filenames)])
+        self.file_select.on_change('value', self.callback_file_select)
 
-        self.layout = column([self.p, self.slider])  #, sizing_mode='fixed')
+        # toggle switch to pick label on click
+        self.button_toggle_label_picker = Toggle(label='Label picker ON',
+                                                 active=True)
+        self.button_toggle_label_picker.on_click(self.toggle_picker)
+        self.view.add_tap_callback(self.callback_pick_label)
 
-    def set_toolsize(self, toolsize):
-        self.toolsize = toolsize
-        self.zoom_callback(None, None, None)
+        self.del_label_button = Button(label="Delete selected label",
+                                       button_type='primary')
+        self.del_label_button.on_click(self.callback_del_label)
 
-    def zoom_callback(self, attr, old, new):
-        '''Adjusts glyph size corresponding to drawing width with image coord to screen coord ratio'''
+        self.channel_select_button = RadioButtonGroup(
+            labels=self.datahandler.channels, active=2)
+        self.channel_select_button.on_click(self.callback_channel_select)
 
-        if self.width > self.height:
-            self.draw_r.glyph.line_width = self.toolsize * (
-                self.p.plot_width) / (self.p.x_range.end -
-                                      self.p.x_range.start)
+        self.label_select = Select(title="Selected label",
+                                   value='-1',
+                                   options=['-1'])
+        self.label_select.on_change('value', self.callback_label_select)
+        self.update_label_select_list()
+
+        self.tool_size_slider = Slider(title='tool size',
+                                       start=1,
+                                       end=100,
+                                       value=self.view.get_toolsize(),
+                                       step=1)
+        self.tool_size_slider.on_change('value', self.callback_tool_size)
+
+        self.alpha_slider = Slider(title='channel alpha',
+                                   start=0,
+                                   end=1.,
+                                   value=0.5,
+                                   step=0.01)
+        self.alpha_slider.on_change('value', self.callback_ch_alpha)
+
+        self.l = widgetbox([
+            row(self.button_toggle_label_picker, width=600),
+            self.channel_select_button,
+            self.tool_size_slider,
+            self.alpha_slider,
+            self.label_select,
+            self.del_label_button,
+            self.file_select,
+            self.save_button,
+            self.discard_button,
+        ],
+                           width=600)
+
+    def callback_save_button(self, button):
+        self.datahandler.save_channel(self.drawing_ch)
+
+    def callback_del_label(self, button):
+
+        # ~ self.datahandler.delete_val_from_channel(int(self.label_select.value),
+        # ~ 'annotations')
+        # ~ self.datahandler.delete_val_from_channel(int(self.label_select.value),
+        # ~ 'predictions')
+        # ~ self.update_label_select_list()
+        # ~ self.orthoview.top.force_update('annotations')
+        # ~ self.orthoview.top.force_update('predictions')
+
+        self.datahandler.delete_val_from_channel(int(self.label_select.value),
+                                                 self.drawing_ch)
+        self.update_label_select_list()
+        self.view.force_update(self.drawing_ch)
+
+    def callback_discard_button(self, button):
+        #reload current img
+        self.load_and_display(self.datahandler.idx)
+
+    def callback_file_select(self, attr, old, new):
+        print('loading img', new)
+
+        self.datahandler.save_channel(self.drawing_ch)
+        self.load_and_display(int(new))
+
+    def load_and_display(self, idx):
+        self.datahandler.load_images(idx)
+        self.view.set_images(self.datahandler.images)
+        self.update_label_select_list()
+
+    def toggle_picker(self, state):
+        if state:
+            self.button_toggle_label_picker.label = 'Label picker ON'
         else:
-            self.draw_r.glyph.line_width = self.toolsize * (
-                self.p.plot_height) / (self.p.y_range.start -
-                                       self.p.y_range.end)
+            self.button_toggle_label_picker.label = 'Label picker OFF'
 
-    def set_drawing_channel(self, channel):
-        self.drawing_channel = channel
+    def callback_pick_label(self, event):
+        if self.button_toggle_label_picker.active:
+            z = self.view.get_zslice()
+            x = int(round(event.y))
+            y = int(round(event.x))
+            ch = self.channel_select_button.labels[
+                self.channel_select_button.active]
+            self.label_select.value = str(
+                self.view.get_npimage(ch)[:, ::-1][z, x, y])
 
-    def set_drawing_alpha(self, alpha):
-        '''sets alpha of the drawing tool as well as drawing channel'''
+    def callback_label_select(self, attr, old, new):
+        '''updates drawing color attribute view renderer'''
+        self.view.set_drawing_color(int(new))
 
-        self.draw_r.glyph.line_alpha = alpha
-        self.renderers[self.drawing_channel].glyph.global_alpha = alpha
+    def callback_on_drawing(self, attr, old, new):
+        ''''''
+        self.update_label_select_list()
 
-    def get_drawing_alpha(self):
-        return self.renderers[self.drawing_channel].glyph.global_alpha
+    def update_label_select_list(self):
+        '''List of label to choose from.'''
 
-    def set_drawing_color(self, color):
+        ch = self.channel_select_button.labels[
+            self.channel_select_button.active]
+        unique_labels = np.unique(self.datahandler.images[ch])
+        # add an extra label to annotate new objects
+        unique_labels = np.append(unique_labels, unique_labels.max() + 1)
+        unique_labels = list({-1, 0}.union(set(unique_labels)))
+        unique_labels.sort()
 
-        # value drawn on image data
-        self.drawing_color = color
+        self.label_select.options = [str(l) for l in unique_labels]
+        if self.label_select.value not in self.label_select.options:
+            self.label_select.value = '-1'
 
-        # change the glyph color as well
-        low = self.renderers[self.drawing_channel].glyph.color_mapper.low
-        high = self.renderers[self.drawing_channel].glyph.color_mapper.high
-        palette = self.renderers[
-            self.drawing_channel].glyph.color_mapper.palette
-        mapping = palette[round((color - low) / (high - low) * len(palette))]
-        if mapping == (0, 0, 0, 0):
-            mapping = 'white'  # draw white lines instead of transparent
-        self.draw_r.glyph.line_color = mapping
+    def callback_tool_size(self, attr, old, new):
+        self.view.set_toolsize(new)
 
-    def add_drawing_tools(self, drawing_channel):
-        self.drawing_channel = drawing_channel
-        self.draw_source = ColumnDataSource({'xs': [], 'ys': []})
-        # TODO calculate ratio from fig size, zoom level and image resolution
-        self.draw_r = self.p.multi_line('xs',
-                                        'ys',
-                                        source=self.draw_source,
-                                        line_cap='round',
-                                        line_join='round',
-                                        line_width=1,
-                                        line_alpha=self.get_drawing_alpha())
-        self.set_drawing_color(-1)
-        self.set_toolsize(3)
-        self.freehand_draw = FreehandDrawTool(renderers=[self.draw_r],
-                                              num_objects=1)
-        self.p.add_tools(self.freehand_draw)
-        # ~ self.p.toolbar.active_tap = self.freehand_draw
+    def callback_ch_alpha(self, attr, old, new):
+        '''update alpha of currently selected channel'''
 
-        # ~ r2 = self.p.patches('xs', 'ys', source=self.draw_source, legend='corrections_poly', line_width=0 ,fill_alpha=0.5)
-        # ~ c1 = self.p.circle(x=[], y=[], color='red', size=5)
-        # ~ self.p.add_tools(PolyDrawTool(vertex_renderer=c1, renderers=[r, r2]))
-        # ~ self.p.add_tools(PolyEditTool(vertex_renderer=c1, renderers=[r2]))
+        ch = self.channel_select_button.labels[
+            self.channel_select_button.active]
+        self.view.set_channel_alpha(ch, new)
 
-        self.draw_source.on_change('data', self.draw_callback)
+    def callback_channel_select(self, active):
+        '''updates selected channel'''
+        channel = self.channel_select_button.labels[active]
+        self.update_label_select_list()
 
-    def draw_callback(self, attr, old, new):
-        '''burn drawn glyph in annotation image and delete them
-        '''
-
-        # TODO adjust coordinates when axis != 0 and xy_ratio != 1
-        if new['xs']:  # check that the callback is not triggered by deletion (i.e. itself)
-            xs = np.asarray(np.rint(np.asarray(new['xs'][0]) - 0.5), dtype=int)
-            ys = np.asarray(np.rint(np.asarray(new['ys'][0]) - 0.5), dtype=int)
-            pts = np.stack([xs, ys], axis=1)
-            pts = pts.reshape((-1, 1, 2))
-
-            # draw on master image
-            npimg = self.npimages[self.drawing_channel]
-            # TODO take care of sampling when drawing on right and front views
-            cv.polylines(npimg[self.slice, ::-1], [pts], False,
-                         (self.drawing_color), self.toolsize, cv.LINE_4)
-            # update datasource
-            self.force_update(self.drawing_channel)
-            # empty drawing source
-            self.draw_source.data = {'xs': [], 'ys': []}
-
-    @staticmethod
-    def adjust_legend(legend_handle):
-        legend_handle.click_policy = 'hide'
-        legend_handle.glyph_width = 0
-        legend_handle.glyph_height = 15
-        legend_handle.label_standoff = 0
-        legend_handle.spacing = 0
-        legend_handle.padding = 5
-        legend_handle.label_text_font_size = '10pt'
-        legend_handle.label_text_baseline = 'middle'
-        legend_handle.label_height = 15
-        legend_handle.label_width: 25
-
-        legend_handle.background_fill_color = "white"
-        legend_handle.background_fill_alpha = 0.3
-        legend_handle.inactive_fill_color = 'black'
-        legend_handle.inactive_fill_alpha = 0.3
+        self.alpha_slider.value = self.view.get_channel_alpha(channel)
