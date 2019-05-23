@@ -1,283 +1,27 @@
 import numpy as np
 import pandas as pd
-import os
-import PIL.Image
 
-from skimage.io import imsave, imread
 
 from bokeh.plotting import figure
 from bokeh.models import Range1d, ColorBar, WheelZoomTool
 from bokeh.models import BoxSelectTool, LassoSelectTool
 from bokeh.models import ColumnDataSource, Legend, LegendItem
-from bokeh.models.glyphs import ImageURL
-from bokeh.palettes import viridis, d3, brewer, inferno
-from bokeh.transform import factor_cmap, linear_cmap
 from bokeh.layouts import gridplot, layout, row
+from bokeh.transform import linear_cmap
+from bokeh.palettes import viridis, d3, brewer, inferno
+
+from inter_view.utils import update_color_mapping
 
 # TODO
-# set aspect ratio of all fig size (instead of max_d) --> see ImageStackWithSlider
-# move update_color_mapping, read_image size, etc. to new utils module
+# consistent naming: plot(p), renderer(r), glyph(g), layout(l), etc.
+# outliers selection (when hue=outliers) + save_df
 # marginal plots: if hue is catgorical, plot kde with diferent colors
 # barplots of current hue count (category) or histogram (numeric)
-# outliers selection (when hue=outliers) + save_df
 # data table
 # make image tabs into a bokeh composition --> propagate update functions
 # menu for scatter size selection --> autoscale to reasonable values
 # expose plot config like: scatter alpha, linear/log axis
 # separate legend and colorbar
-
-
-def update_color_mapping(source, hue):
-    ''' Determines if 'hue' refer to categorical or numerical data and sets the 'color' column in 'source' accordingly.
-        
-        NOTE:
-        ----
-        
-        color mapping with bokeh cmap on client side is buggy --> pre-compute color in data source column
-        '''
-
-    if hue == 'disabled':
-        source.data['color'] = ['grey' for c in source.data['color']]
-        return {'hue_type': 'disabled', 'cmap': None}
-
-    else:
-
-        if any(isinstance(val, str)
-               for val in source.data[hue]):  # categorical column
-            factors = sorted(list(set(str(f) for f in source.data[hue])))
-            palette_length = min(256, len(factors))
-
-            if palette_length <= 2:
-                palette = brewer['Set1'][3][0:palette_length]
-            elif palette_length <= 9:
-                palette = brewer['Set1'][palette_length]
-            elif palette_length <= 20:
-                palette = d3['Category20'][palette_length]
-            else:
-                palette = viridis(palette_length)
-
-            lut = dict(zip(factors, palette))
-            source.data['color'] = [lut[f] for f in source.data[hue]]
-
-            return {
-                'hue_type':
-                'category',
-                'cmap':
-                factor_cmap(field_name=hue, palette=palette, factors=factors)
-            }
-
-        else:  # numerical column
-            palette = viridis(256)
-            low = min(source.data[hue])
-            high = max(source.data[hue])
-
-            source.data['color'] = [
-                palette[int((v - low) / (high - low) * 255)]
-                for v in source.data[hue]
-            ]
-
-            # return colormap to update colorbars
-            return {
-                'hue_type':
-                'numeric',
-                'cmap':
-                linear_cmap(field_name=hue,
-                            palette=viridis(256),
-                            low=low,
-                            high=high)
-            }
-
-
-def read_image_size(path):
-    img = PIL.Image.open(path)
-    return img.size
-
-
-class TiledImages():
-    '''
-    Creates a layout with multiple images.
-    
-    '''
-
-    def __init__(self, image_paths, **kwargs):
-
-        self.image_paths = image_paths
-        self.kwargs = kwargs
-        self.plot()
-
-    def update_image_url(self, image_paths):
-
-        if len(image_paths) != len(self.image_paths):
-            raise ValueError('Trying to update {} images with {} paths'.format(
-                len(self.image_paths), len(image_paths)))
-
-        self.image_paths = image_paths
-        for key, path in self.image_paths.items():
-            self.plot_image(key)
-
-    def plot(self):
-
-        self.figures = {}
-        for key, path in self.image_paths.items():
-            self.figures[key] = figure(
-                active_scroll='wheel_zoom',
-                active_drag='pan',
-                toolbar_location=None,
-                plot_width=200,
-                plot_height=200,
-                y_axis_location=None,
-                x_axis_location=None,
-                title=key,
-            )
-
-            self.figures[key].select(WheelZoomTool).maintain_focus = False
-            self.figures[key].title.text_font_size = '8pt'
-
-            self.figures[key].outline_line_color = None
-            self.figures[key].grid.visible = False
-            self.figures[key].background_fill_color = None
-            self.figures[key].border_fill_color = None
-
-            self.plot_image(key)
-
-        self.p = row(list(self.figures.values()), sizing_mode='fixed')
-
-    def plot_image(self, key):
-
-        width, height = read_image_size(self.image_paths[key])
-        server_img_url = os.path.join(os.path.basename(os.getcwd()),
-                                      self.image_paths[key])
-
-        max_d = max(height, width)
-        self.figures[key].x_range = Range1d(start=0,
-                                            end=max_d,
-                                            bounds=(0, max_d))
-        self.figures[key].y_range = Range1d(start=max_d,
-                                            end=0,
-                                            bounds=(0, max_d))
-
-        img_urls = self.figures[key].select(ImageURL)
-        # ~ print(type(img_urls))
-        if img_urls:  # update existing
-            img_urls[0].url = [server_img_url]
-            img_urls[0].w = width
-            img_urls[0].h = height
-            img_urls[1].url = [server_img_url]
-            img_urls[1].w = width
-            img_urls[1].h = height
-        else:
-            self.figures[key].image_url(url=[server_img_url],
-                                        x=0,
-                                        y=0,
-                                        w=width,
-                                        h=height,
-                                        anchor='top_left')
-
-
-class ImageWithOverlay():
-    '''
-    Creates a figure with an image and patches overlaid.
-    
-    '''
-
-    def __init__(self,
-                 image_path,
-                 source,
-                 patch_x,
-                 patch_y,
-                 center_x,
-                 center_y,
-                 tooltips_columns=None,
-                 **kwargs):
-
-        self.source = source
-        self.kwargs = kwargs
-
-        self.patch_x = patch_x
-        self.patch_y = patch_y
-        self.center_x = center_x
-        self.center_y = center_y
-
-        self.width, self.height = read_image_size(image_path)
-
-        self.server_img_url = os.path.join(os.path.basename(os.getcwd()),
-                                           image_path)
-
-        max_d = max(self.height, self.width)
-        self.x_range = Range1d(start=0, end=max_d, bounds=(0, max_d))
-        self.y_range = Range1d(start=max_d, end=0, bounds=(0, max_d))
-
-        self.tooltips_formatting = [
-            ("(x,y)", "($x{0.}, $y{0.})"),
-        ]
-        if tooltips_columns:
-            self.tooltips_formatting += [(s.replace('_', ' '), '@' + s)
-                                         for s in tooltips_columns]
-
-        self.patch_config = {
-            'line_color': 'color',
-            'line_alpha': 1.0,
-            'fill_alpha': 0.0,
-            'line_width': 2,
-            'hover_alpha': 0.5,
-            'hover_color': 'pink',
-            'nonselection_line_color':
-            'white',  #color', # bug when using view, wrong color indexing
-            'nonselection_line_alpha': 0.2,
-            'nonselection_fill_alpha': 0.0,
-            'selection_line_color': 'white',  #color',
-            'selection_line_alpha': 1.0,
-            'selection_fill_alpha': 0.0,
-        }
-
-        self.plot()
-
-    def plot(self):
-
-        self.p = figure(
-            x_range=self.x_range,
-            y_range=self.y_range,
-            tools='tap,wheel_zoom,hover,lasso_select,box_select,pan,reset',
-            tooltips=self.tooltips_formatting,
-            active_scroll='wheel_zoom',
-            active_drag='box_select',
-            toolbar_location='above',
-            plot_width=600,
-            y_axis_location=None,
-            x_axis_location=None)
-
-        self.p.select(WheelZoomTool).maintain_focus = False
-        self.p.select(BoxSelectTool).select_every_mousemove = True
-        self.p.select(LassoSelectTool).select_every_mousemove = True
-
-        self.p.grid.visible = False
-        self.p.background_fill_color = None
-        self.p.border_fill_color = None
-        self.p.outline_line_color = None
-
-        self.p.image_url(url=[self.server_img_url],
-                         x=0,
-                         y=0,
-                         w=self.width,
-                         h=self.height,
-                         anchor='top_left')
-
-        # hack: invisible points to allow lasso selection
-        self.scatter = self.p.scatter(x=self.center_y,
-                                      y=self.center_x,
-                                      size=0,
-                                      alpha=0.,
-                                      source=self.source,
-                                      **self.kwargs)
-        self.patches = self.p.patches(xs=self.patch_y,
-                                      ys=self.patch_x,
-                                      source=self.source,
-                                      name='masks',
-                                      **self.patch_config,
-                                      **self.kwargs)
-
-        self.p.hover.point_policy = 'follow_mouse'
-        self.p.hover.names = ['masks']  # only show tooltips when hover patches
 
 
 class JointPlot():
@@ -377,8 +121,7 @@ class JointPlot():
         self.plot_vertical_histo()
         self.plot_horizontal_histo()
         self.p = gridplot([[self.ps, self.pv], [self.ph, None]],
-                          merge_tools=False,
-                          sizing_mode='fixed')
+                          merge_tools=False)
 
     def plot_scatter(self):
         self.ps = figure(
