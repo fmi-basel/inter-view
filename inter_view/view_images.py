@@ -32,9 +32,10 @@ class TiledImages():
     
     '''
 
-    def __init__(self, image_paths, **kwargs):
+    def __init__(self, image_paths, show_title=True, **kwargs):
 
         self.image_paths = image_paths
+        self.show_title = show_title
         self.kwargs = kwargs
         self.plot()
 
@@ -60,7 +61,7 @@ class TiledImages():
                 plot_height=200,
                 y_axis_location=None,
                 x_axis_location=None,
-                title=key,
+                title=key if self.show_title else '',
             )
 
             self.figures[key].select(WheelZoomTool).maintain_focus = False
