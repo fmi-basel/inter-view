@@ -78,7 +78,7 @@ class DataHandler:
 
     def save_channel(self, ch):
         imsave(os.path.join(self.paths[ch], self.filenames[self.idx]),
-               self.images[ch])
+               self.images[ch].squeeze())
 
     def delete_val_from_channel(self, val, ch):
         self.images[ch][self.images[ch] == val] = -1
