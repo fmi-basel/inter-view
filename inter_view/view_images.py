@@ -7,7 +7,7 @@ from inter_view.utils import read_image_size
 from skimage.io import imsave, imread
 
 from bokeh.plotting import figure
-from bokeh.models import Range1d, ColorBar, WheelZoomTool
+from bokeh.models import Range1d, ColorBar, WheelZoomTool, TapTool
 from bokeh.models import BoxSelectTool, LassoSelectTool
 from bokeh.models import ColumnDataSource, Legend, LegendItem
 from bokeh.models.glyphs import ImageURL
@@ -106,6 +106,235 @@ class TiledImages():
                                         w=width,
                                         h=height,
                                         anchor='top_left')
+
+
+class ImageLayers():
+    '''
+    Create a figure with image layers and alpha sliders
+    '''
+
+    def __init__(self, image_paths, **kwargs):
+
+        self.image_paths = image_paths
+        self.alpha_sliders = {
+            key: Slider(title=key,
+                        start=0,
+                        end=1.0,
+                        value=1. / len(image_paths),
+                        step=1. / 255)
+            for key in image_paths.keys()
+        }
+        self.renderers = {}
+        self.kwargs = kwargs
+
+        self.plot()
+        self.add_alpha_slider_callbacks()
+
+    def add_alpha_slider_callbacks(self):
+        def _get_callback(key):
+            def update_alpha(attr, old, new):
+                self.renderers[key].glyph.global_alpha = new
+
+            return update_alpha
+
+        for key, val in self.alpha_sliders.items():
+            val.on_change('value', _get_callback(key))
+
+    def update_image_url(self, image_paths):
+
+        if len(image_paths) != len(self.image_paths):
+            raise ValueError('Trying to update {} images with {} paths'.format(
+                len(self.image_paths), len(image_paths)))
+
+        self.image_paths = image_paths
+        self.plot_images()
+
+    def plot(self):
+
+        self.x_range = Range1d(start=0, end=600, bounds=(0, 600))
+        self.y_range = Range1d(start=600, end=0, bounds=(0, 600))
+
+        self.p = figure(
+            x_range=self.x_range,
+            y_range=self.y_range,
+            active_scroll='wheel_zoom',
+            active_drag='pan',
+            toolbar_location='above',
+            # ~ plot_width=600,
+            y_axis_location=None,
+            x_axis_location=None)
+
+        self.p.select(WheelZoomTool).maintain_focus = False
+
+        self.p.grid.visible = False
+        self.p.background_fill_color = None
+        self.p.border_fill_color = None
+        self.p.outline_line_color = None
+
+        self.plot_images()
+        self.adjust_legend(self.p.legend)
+
+        self.l = column([self.p] + list(self.alpha_sliders.values()))
+
+    def plot_images(self):
+
+        max_width = 0
+        max_height = 0
+
+        for key in self.image_paths.keys():
+            width, height = self.plot_image(key)
+            max_width = max(max_width, width)
+            max_height = max(max_height, height)
+
+        if max_width / max_height > 1:
+            plot_width = 600
+            plot_height = int(600 * max_height / max_width)
+        else:
+            plot_width = int(600 * max_width / max_height)
+            plot_height = 600
+
+        self.x_range.start = 0
+        self.x_range.end = max_width
+        self.x_range.bounds = (0, max_width)
+        self.y_range.start = max_height
+        self.y_range.end = 0
+        self.y_range.bounds = (0, max_height)
+        self.p.width = plot_width
+        self.p.height = plot_height
+
+    def plot_image(self, key):
+
+        width, height = read_image_size(self.image_paths[key])
+        server_img_url = os.path.join(os.path.basename(os.getcwd()),
+                                      self.image_paths[key])
+
+        img_urls = self.renderers.get(key, None)
+        if img_urls:  # update existing
+            img_urls.glyph.url = [server_img_url]
+            img_urls.glyph.w = width
+            img_urls.glyph.h = height
+            img_urls.glyph.global_alpha = self.alpha_sliders[key].value
+
+        else:
+            self.renderers[key] = self.p.image_url(
+                url=[server_img_url],
+                x=0,
+                y=0,
+                w=width,
+                h=height,
+                global_alpha=self.alpha_sliders[key].value,
+                anchor='top_left',
+                legend=key,
+            )
+
+        return width, height
+
+    @staticmethod
+    def adjust_legend(legend_handle):
+        legend_handle.click_policy = 'hide'
+        legend_handle.glyph_width = 0
+        legend_handle.glyph_height = 15
+        legend_handle.label_standoff = 0
+        legend_handle.spacing = 0
+        legend_handle.padding = 5
+        legend_handle.label_text_font_size = '10pt'
+        legend_handle.label_text_baseline = 'middle'
+        legend_handle.label_height = 15
+        legend_handle.label_width: 25
+
+        legend_handle.background_fill_color = "white"
+        legend_handle.background_fill_alpha = 0.3
+        legend_handle.inactive_fill_color = 'black'
+        legend_handle.inactive_fill_alpha = 0.3
+
+
+class AddedOverlay():
+    '''Adds patch overlay on existing plot'''
+
+    def __init__(self,
+                 p,
+                 source,
+                 patch_x,
+                 patch_y,
+                 center_x,
+                 center_y,
+                 tooltips_columns=None,
+                 **kwargs):
+        self.p = p
+        self.source = source
+        self.kwargs = kwargs
+
+        self.patch_x = patch_x
+        self.patch_y = patch_y
+        self.center_x = center_x
+        self.center_y = center_y
+
+        self.tooltips_formatting = [
+            ("(x,y)", "($x{0.}, $y{0.})"),
+        ]
+        if tooltips_columns:
+            self.tooltips_formatting += [(s.replace('_', ' '), '@' + s)
+                                         for s in tooltips_columns]
+
+        self.patch_config = {
+            'line_color': 'color',
+            'line_alpha': 1.0,
+            'fill_alpha': 0.0,
+            'line_width': 2,
+            'hover_alpha': 0.5,
+            'hover_color': 'pink',
+            'nonselection_line_color':
+            'white',  #color', # bug when using view, wrong color indexing
+            'nonselection_line_alpha': 0.2,
+            'nonselection_fill_alpha': 0.0,
+            'selection_line_color': 'white',  #color',
+            'selection_line_alpha': 1.0,
+            'selection_fill_alpha': 0.0,
+        }
+
+        self.plot()
+
+    def plot(self):
+
+        tap_tool = TapTool()
+        hover_tool = HoverTool()
+        hover_tool.tooltips = self.tooltips_formatting
+        box_select_tool = BoxSelectTool()
+        lasso_select_tool = LassoSelectTool()
+
+        self.p.add_tools(tap_tool)
+        self.p.add_tools(hover_tool)
+        self.p.add_tools(box_select_tool)
+        self.p.add_tools(lasso_select_tool)
+        self.p.toolbar.active_drag = box_select_tool
+        self.p.toolbar.active_tap = tap_tool
+
+        self.p.select(BoxSelectTool).select_every_mousemove = True
+        self.p.select(LassoSelectTool).select_every_mousemove = True
+
+        # hack: invisible points to allow lasso selection
+        self.scatter = self.p.scatter(x=self.center_y,
+                                      y=self.center_x,
+                                      size=0,
+                                      alpha=0.,
+                                      source=self.source,
+                                      **self.kwargs)
+        self.patches = self.p.patches(xs=self.patch_y,
+                                      ys=self.patch_x,
+                                      source=self.source,
+                                      name='masks',
+                                      **self.patch_config,
+                                      **self.kwargs,
+                                      legend='patches')
+
+        self.p.hover.point_policy = 'follow_mouse'
+        self.p.hover.names = ['masks']  # only show tooltips when hover patches
+
+    def force_update(self):
+        '''hack to force bokeh update on client side: reassign datasource dict'''
+
+        self.patches.data_source.data = self.source.data
+        self.scatter.data_source.data = self.source.data
 
 
 class ImageWithOverlay():
