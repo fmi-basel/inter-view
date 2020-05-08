@@ -1,64 +1,58 @@
 import numpy as np
-from collections import OrderedDict
 
 import holoviews as hv
 hv.extension('bokeh', logo=False)
 
-from holoviews.operation.datashader import rasterize, regrid
-import datashader
+from holoviews.operation.datashader import rasterize
 
 import param
 import panel as pn
+import colorcet as cc
+
+# repeat colormap to handle unint16 values
+# needed to handle non continuous labels because colormap is stretched (and not cycled)
+label_cmap = cc.b_glasbey_hv * 256
 
 
-def image_to_hvds(imgs, spacing=1, keys=None):
-    '''Converts a given image to a holoview dataset to facilitate
-    plotting with the correct axis bounds/scaling'''
+def get_img_dims_coords(img, spacing=1):
 
-    if keys is None:
-        keys = list(imgs.keys())
-    imgs = [imgs[key] for key in keys]
-    imgs = [img for img in imgs]
-
-    img = np.stack(imgs, axis=0)
-
-    # get image dims and coords from first image in list
-    img_dims = ['x', 'y', 'z'][:imgs[0].ndim]
-    spacing = np.broadcast_to(spacing, imgs[0].ndim)
+    img_dims = ['x', 'y', 'z'][:img.ndim]
+    spacing = np.broadcast_to(spacing, img.ndim)
     img_coords = [
-        np.arange(d) * s for d, s in zip(imgs[0].shape[::-1], spacing[::-1])
+        np.arange(d) * s for d, s in zip(img.shape[::-1], spacing[::-1])
     ]
 
-    # ds extra dataset coords
-    #     ds_coords = [keys]
-    ds_coords = [hv.Dimension('ch', label='ch', values=keys)]
+    return img_dims, img_coords
 
-    return hv.Dataset((*(img_coords + ds_coords), img),
-                      kdims=img_dims + ['ch'],
-                      vdims=['intensity'])
+
+def image_to_hvds(img, label, spacing=1):
+    '''Converts a 2D/3D image to a holoview dataset to facilitate
+    plotting with the correct axis bounds/scaling'''
+
+    img_dims, img_coords = get_img_dims_coords(img, spacing)
+
+    return hv.Dataset((*(img_coords), img),
+                      kdims=img_dims,
+                      vdims=['intensity'],
+                      label=label)
 
 
 def image_to_rgb_hvds(imgs, spacing=1, keys=None):
-    '''Converts a given image to a holoview dataset to facilitate
-    plotting with the correct axis bounds/scaling'''
+    '''Converts a 2D/3D RGB channels to a holoview dataset to facilitate
+    plotting with the correct axis bounds/scaling
+    '''
 
+    # if now keys given, assumes there are 3|4 channels in the right order
     if keys is None:
         keys = list(imgs.keys())
+
     imgs = tuple(imgs[key] for key in keys)
-    #     img = tuple(img for img in imgs)
 
-    #     img = np.stack(imgs, axis=-1).view(dtype=[('r', np.uint8), ('g', np.uint8), ('b', np.uint8)]).squeeze()
-
-    # get image dims and coords from first image in list
-    img_dims = ['x', 'y', 'z'][:imgs[0].ndim]
-    spacing = np.broadcast_to(spacing, imgs[0].ndim)
-    img_coords = [
-        np.arange(d) * s for d, s in zip(imgs[0].shape[::-1], spacing[::-1])
-    ]
+    img_dims, img_coords = get_img_dims_coords(imgs[0], spacing)
 
     return hv.Dataset((*(img_coords), *imgs),
                       kdims=img_dims,
-                      vdims=list('rgb'),
+                      vdims=keys,
                       label='rgb')
 
 
@@ -67,9 +61,8 @@ class UpdatableOperation(param.Parameterized):
         super().__init__(*args, **kwargs)
 
     def __call__(self, element):
-        return hv.util.Dynamic(element,
-                               operation=self._dynamic_call,
-                               shared_data=False)
+        return hv.util.Dynamic(element, operation=self._dynamic_call).relabel(
+            element.label)
 
     @param.depends()
     def _dynamic_call(self, element):
@@ -82,6 +75,8 @@ class UpdatableOperation(param.Parameterized):
 
 
 class Alpha(UpdatableOperation):
+
+    # see OverlayViewer for a javascript more responsive callback
     alpha = param.Number(default=1.0, bounds=(0., 1.0), step=0.01)
 
     def __init__(self, label='alpha', *args, **kwargs):
@@ -101,16 +96,64 @@ class Slice(UpdatableOperation):
         super().__init__(*args, **kwargs)
 
         self.param.slice_id.label = self.axis
+        self.initialized = False
+        self._widget = pn.Param(self.param,
+                                widgets={
+                                    'slice_id': {
+                                        'type': pn.widgets.DiscreteSlider,
+                                        'formatter': '%.2g'
+                                    }
+                                })[1]
 
-    def update_coords(self, coords):
-        if not np.array_equal(self.param.slice_id.objects, coords):
-            self.param.slice_id.objects = coords
-            self.slice_id = coords[len(coords) // 2]
+    def reset(self):
+        self.initialized = False
+
+    def update_coords(self, element):
+        coords = element.dimension_values(self.axis, expanded=False)
+        self.param.slice_id.objects = coords
+        self.slice_id = coords[len(coords) // 2]
+
+    def _find_nearest_value(self, array, value):
+        array = np.asarray(array)
+        idx = (np.abs(array - value)).argmin()
+        return array[idx]
+
+    def moveto(self, value):
+        '''Move slider to it's closest (discrete) position'''
+
+        discrete_values = self.param.slice_id.objects
+        self.slice_id = self._find_nearest_value(discrete_values, value)
+
+    def __call__(self, element):
+        if not self.initialized:
+
+            if isinstance(element, hv.DynamicMap):
+                # "render" a dummy copy of the DynamicMap  to evaluate and get the slider range
+                try:
+                    pn.Row(super().__call__(element.clone())).embed()
+                except Exception as e:
+                    pass
+
+                self.initialized = True
+            else:
+                self.update_coords(element)
+                self.initialized = True
+
+        return super().__call__(element)
 
     @param.depends('slice_id')
     def _dynamic_call(self, element):
-        self.update_coords(element.dimension_values(self.axis, expanded=False))
+        if not self.initialized:
+            self.update_coords(element)
+
         new_dims_name = [d.name for d in element.kdims if d.name != self.axis]
+
+        # since we are reindexing anyway, flip axis if y-z plane to correct orientation in orthoview
+        # plot can also be flipped afterwards with invert_axes=True but creates BUG when calling "datashader/rasterize"
+        if tuple(new_dims_name) == ('y', 'z'):
+            new_dims_name = ['zb', 'y']
+            # rename dim to avoid conflict between projections with z axis vertical/horizontal
+            element = element.redim(z='zb')
 
         return element.select(**{
             self.axis: self.slice_id
@@ -118,13 +161,7 @@ class Slice(UpdatableOperation):
 
     @property
     def widget(self):
-        return pn.Param(self.param,
-                        widgets={
-                            'slice_id': {
-                                'type': pn.widgets.DiscreteSlider,
-                                'formatter': '%.2g'
-                            }
-                        })[1]
+        return self._widget
 
 
 def split_element(element, axis, values=None):
@@ -136,12 +173,13 @@ def split_element(element, axis, values=None):
     if values is None:
         values = element.dimension_values(axis, expanded=False)
 
-    return OrderedDict((val, element.select(**{
-        axis: val
-    }).reindex(new_dims_name).relabel(val)) for val in values)
-    # ~return OrderedDict((val,element.select(**{axis:val}).reindex(new_dims_name).relabel(val)) for val in values)
+    return tuple(
+        element.select(**{
+            axis: val
+        }).reindex(new_dims_name).relabel(val) for val in values)
 
 
+# slow, faster to build rgb dataset directly
 class format_as_rgb(hv.Operation):
     dim = param.parameterized.Parameter('None')
     normalize_separate = param.Boolean(
@@ -220,74 +258,31 @@ class format_as_rgb(hv.Operation):
         return element
 
 
-class flip_axis(hv.Operation):
-    axis = param.String()
-
+class label_overlay_items(hv.Operation):
+    '''labelled overlayed images so that clickable legend can be displayed'''
     def _process(self, element, key=None):
 
-        # this works for the channel axis (if exist) but not image axis????
-        #         vals = element.dimension_values(self.p.axis, expanded=False)
-        #         return element.redim.values(**{self.p.axis:vals[::-1]})
+        if isinstance(element, (hv.Overlay, hv.NdOverlay)):
 
-        if isinstance(element, (hv.Image, hv.RGB)):
-            element.data[self.p.axis][:] = element.data[self.p.axis][::-1]
+            name = element.dimensions()[0].name
+            labels = element.dimension_values(0)
 
-        elif isinstance(element, (hv.HoloMap, hv.Overlay)):
-            for e in element:
-                flip_axis(e, axis=self.p.axis)
+            items = {
+                label: item.relabel(label)
+                for label, item in zip(labels, element)
+            }
+            return type(element)(items, kdims=[name])
 
         else:
-            raise ValueError(
-                'flip_axis not implement for element of type: {}'.format(
-                    type(element)))
-
-        return element
+            return element
 
 
-# TODO test with larger image+larger window
-# rasterize method that use a different aggregate method for annotation keys
-# TODO pass label keys in annot (handle capitatlization)
-class rasterize_overlay(rasterize):
-    def _process(self, element, key=None):
+def rasterize_custom(elem, label_channels, dynamic=True):
+    '''applies rasterization with "first" aggregation if elem.label 
+    in label_channels, default aggregation otherwise.'''
 
-        # TODO test overlay type
+    aggregator = 'default'
+    if elem.label in label_channels:
+        aggregator = 'first'
 
-        for (group, label), sub_element in element.data.items():
-
-            #             display(self._aggregator_param_value, self.aggregator)
-
-            if label in ['Annot', 'Pred']:
-                #                 print('aaaaa', group, label)
-                self.p.aggregator = datashader.first()
-                element.data[(group, label)] = super()._process(sub_element)
-            else:
-                self.p.aggregator = datashader.mean()
-                element.data[(group, label)] = super()._process(sub_element)
-
-        return element
-
-
-# rasterize with custom aggreagtion methods for labels e.g 'first'
-# ~class regrid_custom_agg(regrid):
-# ~'''Maps element label to custom aggregation method if specified'''
-
-# ~agg_mapping = param.Dict()
-
-# ~def _get_aggregator(self, element, add_field=True):
-
-# ~agg_mapping = self.p.agg_mapping.get(element.label)
-# ~if agg_mapping:
-# ~agg = self._agg_methods[agg_mapping]()
-# ~else:
-# ~agg = super()._get_aggregator(element, add_field)
-
-# ~return agg
-
-# ~class rasterize_custom_agg(rasterize):
-# ~'''Replaces regrid by regrid_custom_agg for hv.Image'''
-
-# ~agg_mapping = param.Dict()
-
-# TODO find a way to do it without breaking normal rasterize
-# replacing _transforms at instance level in init does not seem to work
-# ~rasterize_custom_agg._transforms[0] = (hv.Image, regrid_custom_agg)
+    return rasterize(elem, aggregator=aggregator, dynamic=dynamic)
