@@ -206,9 +206,9 @@ class OrthoViewer(param.Parameterized):
         xz.opts(
             opts.Image(xaxis='bare', yaxis='bare', frame_width=self.ref_width))
 
-        #         xy.opts(opts.Image(frame_width=self.ref_width))
-        #         zy.opts(opts.Image(frame_height=self.ref_height))
-        #         xz.opts(opts.Image(frame_width=self.ref_width))
+        # ~xy.opts(opts.Image(frame_width=self.ref_width))
+        # ~zy.opts(opts.Image(frame_height=self.ref_height))
+        # ~xz.opts(opts.Image(frame_width=self.ref_width))
 
         panel_xy = self.z_viewer.panel(xy)
         panel_zy = self.x_viewer.panel(zy)

@@ -140,6 +140,7 @@ class FreehandEditor(param.Parameterized):
         '''range stream used to adjust glyph size based on zoom level, assumes data_aspect=1''',
         precedence=-1)
     zoom_level = param.Number(1.0, precedence=-1)
+    zoomed_initialized = param.Boolean(False, precedence=-1)
 
     drawingtool = param.Parameter(precedence=-1)
     slicing_info = param.Callable(
@@ -147,15 +148,25 @@ class FreehandEditor(param.Parameterized):
         precedence=-1)
     cmap = param.Parameter(label_cmap, precedence=-1)
 
-    tool_width = param.Integer(5, bounds=(1, 300))
+    tool_width = param.Integer(20, bounds=(1, 300))
+    _plot_width = param.Integer(500, precedence=-1)
 
-    def __init__(self, label_editor, *args, **kwargs):
+    def __init__(self, label_editor, plot_width, *args, **kwargs):
         super().__init__(*args, **kwargs)
 
         self.label_editor = label_editor
+        self._plot_width = plot_width
 
         # grey glyph for drawing label -1 (unlabeled)
         self.cmap[-1] = '#999999'
+
+        self.reset()
+
+    def reset(self):
+        '''reset drawtool plots'''
+
+        self.label_editor.kdims_val = []
+        self.zoomed_initialized = False
 
         self.pipe = streams.Pipe(data=[])
         self.drawingtool = hv.DynamicMap(self.plot_path, streams=[self.pipe])
@@ -172,17 +183,27 @@ class FreehandEditor(param.Parameterized):
     def monitor_zoom_level(self):
         zrange = self.zoom_range.x_range
 
+        if self.label_editor.kdims_val:
+            image_px_width = len(self.label_editor.kdims_val[0])
+        else:
+            image_px_width = self._plot_width
+
         if zrange is None:
-            self.zoom_level = 1.
+            self.zoom_level = self._plot_width / image_px_width
 
         else:
             zoom_width = zrange[1] - zrange[0]
             # TODO handle other than xy axis
-            full_width = self.kdims_val[0].max() - self.kdims_val[0].min()
-            self.zoom_level = full_width / zoom_width
+            full_width = self.label_editor.kdims_val[0].max(
+            ) - self.label_editor.kdims_val[0].min()
+            self.zoom_level = full_width / zoom_width * self._plot_width / image_px_width
 
     @param.depends('label_editor.drawing_label', 'tool_width', 'zoom_level')
     def plot_path(self, data):
+        # at this stage is redered and size known
+        if not self.zoomed_initialized:
+            self.monitor_zoom_level()
+            self.zoomed_initialized = True
 
         path = hv.Path(data)
         path.opts(
@@ -197,26 +218,54 @@ class FreehandEditor(param.Parameterized):
                    'pointer_pos.x', 'pointer_pos.y')
     def plot_pointer(self):
 
-        pt = hv.Points((self.pointer_pos.x, self.pointer_pos.y))
+        if not self.zoomed_initialized:
+            self.monitor_zoom_level()
+            self.zoomed_initialized = True
+
+        # limit to image bounds
+        if self.label_editor.kdims_val:
+            x_max = self.label_editor.kdims_val[0].max()
+            y_max = self.label_editor.kdims_val[1].max()
+        else:
+            x_max = 0.
+            y_max = 0.
+
+        pos_x = self.pointer_pos.x
+        if pos_x is None:
+            pos_x = 0.
+
+        pos_y = self.pointer_pos.y
+        if pos_y is None:
+            pos_y = 0.
+
+        pos_x = max(min(pos_x, x_max), 0)
+        pos_y = max(min(pos_y, y_max), 0)
+
+        pt = hv.Points((pos_x, pos_y))
         pt.opts(
             opts.Points(
-                size=self.tool_width * self.zoom_level + 1,
+                size=self.tool_width * self.zoom_level,
                 color=self.cmap[self.label_editor.drawing_label],
+                shared_axes=True,
             ))
 
         return pt
 
     @param.depends('clicked_pos.x', 'clicked_pos.y', watch=True)
     def monitor_clicked_label(self):
-        if self.clicked_pos.x is not None:
+        if self.clicked_pos.x is not None and self.clicked_pos.y is not None:
             # TODO update to handle spacing/3D
 
             axis, slice_id = self.slicing_info()
             x = int(round(self.clicked_pos.x))
             y = int(round(self.clicked_pos.y))
 
-            self.label_editor.set_picked_label(
-                int(self.label_editor.array[slice_id, y, x]))
+            if self.label_editor.array.ndim > 2:
+                self.label_editor.set_picked_label(
+                    int(self.label_editor.array[slice_id, y, x]))
+            else:
+                self.label_editor.set_picked_label(
+                    int(self.label_editor.array[y, x]))
 
     def __call__(self, dmap, slicing_info):
         self.slicing_info = slicing_info
@@ -233,10 +282,24 @@ class FreehandEditor(param.Parameterized):
         pts = np.stack([xs, ys], axis=1).astype(np.int32)
 
         mask = np.zeros_like(self.label_editor.array, np.uint8)
-        axis, slice_id = self.slicing_info()
+        if mask.ndim > 2:
+            axis, slice_id = self.slicing_info()
+            cv.polylines(
+                mask[slice_id],
+                [pts],
+                False,
+                1,
+                self.tool_width,  # // 2,
+                cv.LINE_8)
+        else:
+            cv.polylines(
+                mask,
+                [pts],
+                False,
+                1,
+                self.tool_width,  # // 2,
+                cv.LINE_8)
 
-        cv.polylines(mask[slice_id], [pts], False, 1, self.tool_width // 2,
-                     cv.LINE_8)
         mask = mask.astype(bool)
 
         self.label_editor.write_label(mask)

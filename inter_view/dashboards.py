@@ -2,14 +2,17 @@ import numpy as np
 import pandas as pd
 import param
 import panel as pn
+import holoviews as hv
 
 from holoviews import opts
 from bokeh.models import HoverTool
 
 from inter_view.utils import label_cmap, split_element, rasterize_custom
-from inter_view.view_images import SliceViewer, OverlayViewer
+from inter_view.view_images import SliceViewer, OverlayViewer, OrthoViewer
 from inter_view.edit_images import LabelEditor, FreehandEditor
 from inter_view.io import ImageHandler
+
+# TODO rename group according to plot (slice, orthoview, etc.) --> set option accordign to names
 
 
 class SegmentationSliceDashBoard(param.Parameterized):
@@ -18,6 +21,7 @@ class SegmentationSliceDashBoard(param.Parameterized):
     image_handler = param.Parameter()
     slice_viewer = param.Parameter()
     overlay_viewer = param.Parameter()
+    plot_width = param.Integer(500)
 
     include_background = param.Boolean(
         False,
@@ -61,13 +65,14 @@ class SegmentationSliceDashBoard(param.Parameterized):
 
         hover = HoverTool(tooltips=[('label id', '@image')])
         dmaps = dmaps.opts(
+            opts.Overlay(normalize=False),
             opts.Image(aspect='equal',
                        show_legend=False,
                        normalize=False,
                        xaxis='bare',
                        yaxis='bare',
                        cmap='greys_r',
-                       frame_width=500),
+                       frame_width=self.plot_width),
             opts.Overlay(show_title=False),
             opts.Image(self.segm,
                        cmap=label_cmap,
@@ -91,6 +96,101 @@ class SegmentationSliceDashBoard(param.Parameterized):
                       self.slice_viewer.slicer.widget, alphas_wg)).servable()
 
 
+class SegmentationOrthoDashBoard(param.Parameterized):
+    '''Dashboard to view segmentation results (raw + segm channels)'''
+
+    image_handler = param.Parameter()
+    ortho_viewer = param.Parameter()
+    overlay_viewer = param.Parameter()
+    plot_width = param.Integer(500)
+
+    include_background = param.Boolean(
+        False,
+        doc=
+        """Whether the background should be considered as a normal label or transparent"""
+    )
+
+    def __init__(self,
+                 df,
+                 ch_col,
+                 raw,
+                 segm,
+                 spacing_col=None,
+                 *args,
+                 **kwargs):
+        super().__init__(*args, **kwargs)
+
+        self.ortho_viewer = OrthoViewer(ref_width=self.plot_width)
+        self.overlay_viewer = OverlayViewer()
+
+        self.raw = raw
+        self.segm = segm
+        self.ch_col = ch_col
+
+        # keep rows with channels of interest
+        df = df[df.index.get_level_values(ch_col).isin([raw, segm])]
+
+        # keeps row only if raw-segm pair is available
+        df = pd.concat([
+            g
+            for _, g in df.groupby([n for n in df.index.names if n != ch_col])
+            if len(g) == 2
+        ])
+
+        self.image_handler = ImageHandler(df,
+                                          ds_dims=[ch_col],
+                                          spacing_col=spacing_col)
+
+        hover = HoverTool(tooltips=[('label id', '@image')])
+
+        opts.defaults(
+            opts.Overlay(normalize=False),
+            opts.Image('Image.{}'.format(raw),
+                       aspect='equal',
+                       cmap='greys_r',
+                       show_legend=False,
+                       bgcolor='black'),
+            opts.HLine(line_dash='dashed', line_width=2, line_color='white'),
+            opts.VLine(line_dash='dashed', line_width=2, line_color='white'),
+            opts.Image('Image.{}'.format(segm),
+                       aspect='equal',
+                       cmap=label_cmap,
+                       show_legend=False,
+                       clipping_colors={'min': (0, 0, 0, 0)},
+                       clim=(int(not self.include_background),
+                             len(label_cmap)),
+                       tools=[hover],
+                       bgcolor='black'))
+
+    @param.depends('image_handler.load_count')
+    def plot_orthoview(self):
+        self.ortho_viewer.reset()
+
+        dmaps = split_element(self.image_handler.ds,
+                              self.ch_col,
+                              values=[self.raw, self.segm])
+
+        ortho_dmaps = tuple(self.ortho_viewer(dmap) for dmap in dmaps)
+        ortho_dmaps = tuple(
+            tuple(rasterize_custom(dmap, [self.segm]) for dmap in dmaps)
+            for dmaps in ortho_dmaps)
+
+        # swap orthoview and overlay dimensions
+        ortho_dmaps = tuple(zip(*ortho_dmaps))
+
+        ortho_dmaps = tuple(
+            self.overlay_viewer(dmaps) for dmaps in ortho_dmaps)
+
+        l = self.ortho_viewer.panel(*ortho_dmaps)
+        l[1][1] = pn.Column(self.image_handler.widgetbox,
+                            self.overlay_viewer.widget)
+
+        return l
+
+    def panel(self):
+        return pn.panel(self.plot_orthoview).servable()
+
+
 class AnnotationDashBoard(param.Parameterized):
     '''Dashboard to view segmentation results (raw + segm channels)'''
 
@@ -108,6 +208,8 @@ class AnnotationDashBoard(param.Parameterized):
     )
     discarding = param.Boolean(False)
 
+    plot_width = param.Integer(500)
+
     def __init__(self,
                  df,
                  ch_col,
@@ -121,7 +223,8 @@ class AnnotationDashBoard(param.Parameterized):
         self.slice_viewer = SliceViewer()
         self.overlay_viewer = OverlayViewer()
         self.label_editor = LabelEditor()
-        self.freehand_editor = FreehandEditor(label_editor=self.label_editor)
+        self.freehand_editor = FreehandEditor(label_editor=self.label_editor,
+                                              plot_width=self.plot_width)
 
         self.raw = raw
         self.segm = segm
@@ -143,6 +246,7 @@ class AnnotationDashBoard(param.Parameterized):
 
     @param.depends('image_handler.load_count')
     def plot_image(self):
+        self.freehand_editor.reset()
 
         # save previous image
         if self.loaded_subdc is not None and not self.discarding:
@@ -160,7 +264,6 @@ class AnnotationDashBoard(param.Parameterized):
         raw_ds, segm_ds = split_element(self.image_handler.ds,
                                         self.ch_col,
                                         values=[self.raw, self.segm])
-        # add handraw annotation tool to the segmentation layer
 
         # extract data array in label editor
         segm_dmap = self.label_editor(segm_ds)
@@ -170,7 +273,14 @@ class AnnotationDashBoard(param.Parameterized):
             slicing_info=lambda: (0, self.slice_viewer.slicer.slice_id))
         #         dmaps = self.slice_viewer(segm_dmap) * self.freehand_editor.drawingtool
 
-        dmaps = tuple(self.slice_viewer(dmap) for dmap in (raw_ds, segm_dmap))
+        if len(segm_ds.kdims) > 2:
+            dmaps = tuple(
+                self.slice_viewer(dmap) for dmap in (raw_ds, segm_dmap))
+        else:
+            dmaps = tuple(
+                hv.util.Dynamic(dmap, operation=lambda x: x.to(hv.Image))
+                for dmap in (raw_ds, segm_dmap))
+
         dmaps = tuple(rasterize_custom(dmap, [self.segm]) for dmap in dmaps)
         dmaps = self.overlay_viewer(dmaps)
 
@@ -183,8 +293,8 @@ class AnnotationDashBoard(param.Parameterized):
                        xaxis='bare',
                        yaxis='bare',
                        cmap='greys_r',
-                       frame_width=500),
-            opts.Overlay(show_title=False),
+                       frame_width=self.plot_width),
+            opts.Overlay(show_title=False, normalize=False),
             opts.Image(self.segm,
                        cmap=label_cmap,
                        clipping_colors={'min': (0, 0, 0, 0)},
@@ -196,6 +306,9 @@ class AnnotationDashBoard(param.Parameterized):
 
     def save_annot(self, event=None):
         npimg = self.label_editor.array.astype(np.int16)
+        print('saving {}'.format(
+            self.loaded_subdc.set_index(
+                self.ch_col).lsc[self.segm].lsc.path[0]))
         self.loaded_subdc.set_index(self.ch_col).lsc[self.segm].lsc.write(
             npimg,
             compressed=False)  # compression does not handle negative label
@@ -220,7 +333,14 @@ class AnnotationDashBoard(param.Parameterized):
         ih_widgets.append(save_button)
         ih_widgets.append(discard_button)
 
-        return pn.Row(
-            pn.Column(hvimg, self.slice_viewer.slicer.widget),
-            pn.Column(ih_widgets, alphas_wg, self.label_editor.widgets,
-                      self.freehand_editor.widgets)).servable()
+        # add z slider if 3D
+        if len(self.slice_viewer.slicer.param.slice_id.objects) > 1:
+            return pn.Row(
+                pn.Column(hvimg, self.slice_viewer.slicer.widget),
+                pn.Column(ih_widgets, alphas_wg, self.label_editor.widgets,
+                          self.freehand_editor.widgets)).servable()
+        else:
+            return pn.Row(
+                pn.Column(hvimg),
+                pn.Column(ih_widgets, alphas_wg, self.label_editor.widgets,
+                          self.freehand_editor.widgets)).servable()
