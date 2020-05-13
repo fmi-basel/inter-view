@@ -4,6 +4,7 @@ import holoviews as hv
 hv.extension('bokeh', logo=False)
 
 from holoviews.operation.datashader import rasterize
+from bokeh.models import WheelZoomTool
 
 import param
 import panel as pn
@@ -12,6 +13,16 @@ import colorcet as cc
 # repeat colormap to handle unint16 values
 # needed to handle non continuous labels because colormap is stretched (and not cycled)
 label_cmap = cc.b_glasbey_hv * 256
+
+
+def zoom_bounds_hook(bounds):
+    '''restrict zooming out to given bounds'''
+    def _hook(plot, element):
+        plot.state.x_range.bounds = (bounds[0], bounds[2])
+        plot.state.y_range.bounds = (bounds[1], bounds[3])
+        plot.state.select(WheelZoomTool).maintain_focus = False
+
+    return _hook
 
 
 def get_img_dims_coords(img, spacing=1):
