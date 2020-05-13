@@ -89,7 +89,7 @@ class Alpha(UpdatableOperation):
 
 
 class Slice(UpdatableOperation):
-    slice_id = param.ObjectSelector(default=0, objects=[0, 1])
+    slice_id = param.ObjectSelector(default=0, objects=[0])
     axis = param.String(default='z')
 
     def __init__(self, *args, **kwargs):
