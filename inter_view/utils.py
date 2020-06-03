@@ -15,6 +15,7 @@ import colorcet as cc
 label_cmap = cc.b_glasbey_hv * 256
 
 
+# bokeh hook workaround --> remove if holoviews finally handle this
 def zoom_bounds_hook(bounds):
     '''restrict zooming out to given bounds'''
     def _hook(plot, element):

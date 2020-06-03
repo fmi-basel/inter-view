@@ -7,7 +7,7 @@ import holoviews as hv
 from holoviews import opts
 from bokeh.models import HoverTool
 
-from inter_view.utils import label_cmap, split_element, rasterize_custom
+from inter_view.utils import label_cmap, split_element, rasterize_custom, zoom_bounds_hook
 from inter_view.view_images import SliceViewer, OverlayViewer, OrthoViewer
 from inter_view.edit_images import LabelEditor, FreehandEditor
 from inter_view.io import ImageHandler
@@ -66,7 +66,7 @@ class SegmentationSliceDashBoard(param.Parameterized):
         hover = HoverTool(tooltips=[('label id', '@image')])
         dmaps = dmaps.opts(
             opts.Overlay(normalize=False),
-            opts.Image(aspect='equal',
+            opts.Image(data_aspect=1.,
                        show_legend=False,
                        normalize=False,
                        xaxis='bare',
@@ -146,14 +146,14 @@ class SegmentationOrthoDashBoard(param.Parameterized):
         opts.defaults(
             opts.Overlay(normalize=False),
             opts.Image('Image.{}'.format(raw),
-                       aspect='equal',
+                       data_aspect=1.,
                        cmap='greys_r',
                        show_legend=False,
                        bgcolor='black'),
             opts.HLine(line_dash='dashed', line_width=2, line_color='white'),
             opts.VLine(line_dash='dashed', line_width=2, line_color='white'),
             opts.Image('Image.{}'.format(segm),
-                       aspect='equal',
+                       data_aspect=1.,
                        cmap=label_cmap,
                        show_legend=False,
                        clipping_colors={'min': (0, 0, 0, 0)},
@@ -206,6 +206,7 @@ class AnnotationDashBoard(param.Parameterized):
         doc=
         """Whether the background should be considered as a normal label or transparent"""
     )
+    cmap = param.Parameter(label_cmap, precedence=-1)
     discarding = param.Boolean(False)
 
     plot_width = param.Integer(500)
@@ -243,6 +244,9 @@ class AnnotationDashBoard(param.Parameterized):
         self.image_handler = ImageHandler(df,
                                           ds_dims=[ch_col],
                                           spacing_col=spacing_col)
+
+        if not self.include_background:
+            self.cmap = self.cmap[1:]
 
     @param.depends('image_handler.load_count')
     def plot_image(self):
@@ -287,7 +291,7 @@ class AnnotationDashBoard(param.Parameterized):
         dmaps = dmaps * self.freehand_editor.drawingtool
 
         dmaps = dmaps.opts(
-            opts.Image(aspect='equal',
+            opts.Image(data_aspect=1,
                        show_legend=False,
                        normalize=False,
                        xaxis='bare',
@@ -296,11 +300,20 @@ class AnnotationDashBoard(param.Parameterized):
                        frame_width=self.plot_width),
             opts.Overlay(show_title=False, normalize=False),
             opts.Image(self.segm,
-                       cmap=label_cmap,
+                       cmap=self.cmap,
                        clipping_colors={'min': (0, 0, 0, 0)},
                        clim=(int(not self.include_background),
-                             len(label_cmap))),
+                             len(self.cmap))),
         )
+
+        # prevent from zooming outside of image
+        # TODO automatically adjust as function of slicing axis
+        xaxis_vals = raw_ds.dimension_values('x')
+        yaxis_vals = raw_ds.dimension_values('y')
+        bounds = (xaxis_vals.min(), yaxis_vals.min(), xaxis_vals.max(),
+                  yaxis_vals.max())
+
+        dmaps = dmaps.opts(hooks=[zoom_bounds_hook(bounds)])
 
         return dmaps
 

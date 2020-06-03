@@ -7,7 +7,7 @@ from holoviews import opts
 import param
 import panel as pn
 
-from inter_view.utils import Slice
+from inter_view.utils import Slice, zoom_bounds_hook
 
 
 class SliceViewer(param.Parameterized):
@@ -51,9 +51,18 @@ class SliceViewer(param.Parameterized):
 
     def _dynamic_call(self, ds):
         if len(ds.vdims) == 3:
-            return ds.to(hv.RGB)
+            hvimg = ds.to(hv.RGB)
+        else:
+            hvimg = ds.to(hv.Image)
 
-        return ds.to(hv.Image)
+        xaxis_vals = hvimg.dimension_values(hvimg.kdims[0].name)
+        yaxis_vals = hvimg.dimension_values(hvimg.kdims[1].name)
+        bounds = (xaxis_vals.min(), yaxis_vals.min(), xaxis_vals.max(),
+                  yaxis_vals.max())
+
+        hvimg.opts(hooks=[zoom_bounds_hook(bounds)])
+
+        return hvimg
 
     def panel(self, dmap):
         return pn.Column(dmap, self.slicer.widget)
