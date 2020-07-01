@@ -58,9 +58,15 @@ class SegmentationSliceDashBoard(param.Parameterized):
         dmaps = split_element(self.image_handler.ds,
                               self.ch_col,
                               values=[self.raw, self.segm])
-        dmaps = tuple(
-            rasterize_custom(self.slice_viewer(dmap), [self.segm])
-            for dmap in dmaps)
+
+        if len(dmaps[0].kdims) > 2:
+            dmaps = tuple(self.slice_viewer(dmap) for dmap in dmaps)
+        else:
+            dmaps = tuple(
+                hv.util.Dynamic(dmap, operation=lambda x: x.to(hv.Image)).
+                relabel(dmap.label) for dmap in dmaps)
+
+        dmaps = tuple(rasterize_custom(dmap, [self.segm]) for dmap in dmaps)
         dmaps = self.overlay_viewer(dmaps)
 
         hover = HoverTool(tooltips=[('label id', '@image')])
@@ -90,10 +96,17 @@ class SegmentationSliceDashBoard(param.Parameterized):
         hvimg = pn.panel(self.plot_image)
         alphas_wg = pn.panel(self.overlay_viewer.widget)
 
-        return pn.Row(
-            hvimg,
-            pn.Column(self.image_handler.widgetbox,
-                      self.slice_viewer.slicer.widget, alphas_wg)).servable()
+        # add z slider if 3D
+        if len(self.slice_viewer.slicer.param.slice_id.objects) > 1:
+            return pn.Row(
+                hvimg,
+                pn.Column(self.image_handler.widgetbox,
+                          self.slice_viewer.slicer.widget,
+                          alphas_wg)).servable()
+        else:
+            return pn.Row(hvimg,
+                          pn.Column(self.image_handler.widgetbox,
+                                    alphas_wg)).servable()
 
 
 class SegmentationOrthoDashBoard(param.Parameterized):
