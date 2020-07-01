@@ -49,10 +49,13 @@ def image_to_hvds(img, label, spacing=1):
                       label=label)
 
 
-def image_to_rgb_hvds(imgs, spacing=1, keys=None):
+def image_to_rgb_hvds(imgs, spacing=1, keys=None, label=None):
     '''Converts a 2D/3D RGB channels to a holoview dataset to facilitate
     plotting with the correct axis bounds/scaling
     '''
+
+    if label is None:
+        label = 'rgb'
 
     # if now keys given, assumes there are 3|4 channels in the right order
     if keys is None:
@@ -65,7 +68,7 @@ def image_to_rgb_hvds(imgs, spacing=1, keys=None):
     return hv.Dataset((*(img_coords), *imgs),
                       kdims=img_dims,
                       vdims=keys,
-                      label='rgb')
+                      label=label)
 
 
 class UpdatableOperation(param.Parameterized):
