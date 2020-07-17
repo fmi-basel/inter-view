@@ -4,7 +4,8 @@ import param
 import panel as pn
 import holoviews as hv
 
-from holoviews import opts
+from holoviews import opts, dim
+from holoviews.streams import Selection1D
 from bokeh.models import HoverTool
 
 from inter_view.utils import label_cmap, split_element, rasterize_custom, zoom_bounds_hook
@@ -370,3 +371,121 @@ class AnnotationDashBoard(param.Parameterized):
                 pn.Column(hvimg),
                 pn.Column(ih_widgets, alphas_wg, self.label_editor.widgets,
                           self.freehand_editor.widgets)).servable()
+
+
+class ScatterDashBoard(param.Parameterized):
+    '''Dashboard to view 3 dimensions (x,y,color) of a multidimensional dataset 
+    as a scatter plot.'''
+
+    x_key = param.Selector()
+    y_key = param.Selector()
+    color_key = param.Selector()
+
+    props = param.DataFrame(pd.DataFrame())
+
+    selected_row = param.Series(pd.Series([], dtype=int))
+    selection_ids = param.List([])
+
+    def __init__(self,
+                 props,
+                 x_key=None,
+                 y_key=None,
+                 color_key=None,
+                 *args,
+                 **kwargs):
+        super().__init__(*args, **kwargs)
+
+        self.props = props
+
+        available_keys = props.columns.tolist()
+        self.param.x_key.objects = available_keys
+        self.param.y_key.objects = available_keys
+        self.param.color_key.objects = available_keys
+
+        if x_key:
+            self.x_key = x_key
+        else:
+            self.x_key = available_keys[0]
+
+        if y_key:
+            self.y_key = y_key
+        else:
+            self.y_key = available_keys[1]
+
+        if color_key:
+            self.color_key = color_key
+        else:
+            self.color_key = available_keys[2]
+
+    def _selected_hook(self, plot, element):
+        '''Directly access bokeh figure and set selection'''
+        # NOTE only works when called during plot creation
+        # --> redraw entire figure to update selection
+        # In principle it's possible, from a handle, to update only
+        # the selection but update is not triggered
+
+        plot.handles['selected'].indices = self.selection_ids
+
+    @param.depends('x_key', 'y_key', 'color_key', 'selection_ids')
+    def plot_scatter(self):
+
+        tooltips = [
+            ('bloc id', '@bloc_id'),
+            ('cell type', '@cell_type'),
+            ('nucleus id', '@nucleus_id'),
+        ]
+        hover = HoverTool(tooltips=tooltips)
+
+        points = hv.Points(self.props, kdims=[self.x_key, self.y_key])
+
+        # change colormap for categorical values
+        if self.props[self.color_key].dtype == 'O':
+            if len(self.props[self.color_key].unique()) <= 10:
+                cmap = 'Category10'
+            else:
+                cmap = 'Category20'
+            colorbar = False
+            color_levels = None
+        else:
+            cmap = 'viridis'
+            colorbar = True
+            color_levels = len(self.props[self.color_key].unique())
+
+        points.opts(
+            color=self.color_key,
+            tools=[hover, 'box_select', 'lasso_select', 'tap'],
+            size=5,
+            line_color=None,
+            color_levels=color_levels,
+            nonselection_fill_alpha=0.3,
+            selection_line_color='black',
+            selection_line_alpha=1.,
+            active_tools=['wheel_zoom'],
+            cmap=cmap,
+            colorbar=colorbar,
+            colorbar_position='left',
+        )
+
+        # add selection stream and attach callback to update sample/image selection
+        self._selection = Selection1D(source=points)
+
+        @param.depends(self._selection.param.index, watch=True)
+        def update_image_selectors(index):
+            if len(index) > 0:
+                self.selected_row = self.props.iloc[index[0]]
+
+        points.opts(hooks=[self._selected_hook])
+
+        # TODO fix broken adjoint histograms, broken in latest holviews when points color is set
+        return points  #.hist(dimension=[self.x_key, self.y_key], num_bins=100).opts(opts.Histogram(color='grey', yaxis='bare', xaxis='bare'))
+
+    def widget(self):
+        return pn.WidgetBox(
+            'Scatter',
+            self.param.x_key,
+            self.param.y_key,
+            self.param.color_key,
+        )
+
+    def panel(self):
+        return pn.Column(self.plot_scatter, self.widget())
