@@ -15,6 +15,22 @@ from inter_view.io import ImageHandler
 
 # TODO rename group according to plot (slice, orthoview, etc.) --> set option accordign to names
 
+opts.defaults(
+    opts.Points(
+        'props_scatter',
+        frame_width=600,
+        frame_height=600,
+        alpha=0.5,
+        size=5,
+        line_color=None,
+        nonselection_fill_alpha=0.3,
+        selection_line_color='black',
+        selection_line_alpha=1.,
+        active_tools=['wheel_zoom'],
+        colorbar_position='left',
+        title='',
+    ))
+
 
 class SegmentationSliceDashBoard(param.Parameterized):
     '''Dashboard to view segmentation results (raw + segm channels)'''
@@ -436,7 +452,9 @@ class ScatterDashBoard(param.Parameterized):
         ]
         hover = HoverTool(tooltips=tooltips)
 
-        points = hv.Points(self.props, kdims=[self.x_key, self.y_key])
+        points = hv.Points(self.props,
+                           kdims=[self.x_key, self.y_key],
+                           group='props_scatter')
 
         # change colormap for categorical values
         if self.props[self.color_key].dtype == 'O':
@@ -453,17 +471,10 @@ class ScatterDashBoard(param.Parameterized):
 
         points.opts(
             color=self.color_key,
-            tools=[hover, 'box_select', 'lasso_select', 'tap'],
-            size=5,
-            line_color=None,
             color_levels=color_levels,
-            nonselection_fill_alpha=0.3,
-            selection_line_color='black',
-            selection_line_alpha=1.,
-            active_tools=['wheel_zoom'],
             cmap=cmap,
             colorbar=colorbar,
-            colorbar_position='left',
+            tools=[hover, 'box_select', 'lasso_select', 'tap'],
         )
 
         # add selection stream and attach callback to update sample/image selection
