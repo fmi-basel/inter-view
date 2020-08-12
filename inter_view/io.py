@@ -7,6 +7,9 @@ hv.extension('bokeh', logo=False)
 import param
 import panel as pn
 
+from improc.io import LSCAccessor
+LSCAccessor.register()
+
 
 class DataHandler(param.Parameterized):
     dc = param.DataFrame()
@@ -16,9 +19,8 @@ class DataHandler(param.Parameterized):
     updating_widget = param.Boolean(False)
     update_count = param.Integer(0)
 
-    def __init__(self, dc, *args, **kwargs):
+    def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
-        self.dc = dc
         self._add_widgets()
 
     def _get_available_index_level_values(self, level_id):
@@ -27,17 +29,19 @@ class DataHandler(param.Parameterized):
             if index.name is None:
                 index.name = 'index'
         else:
-            lower_levels_index = [w.value for w in self.widgets[:level_id]]
+            lower_levels_index = tuple(w.value
+                                       for w in self.widgets[:level_id])
             index = self.dc.lsc[lower_levels_index].index
 
-        return index.get_level_values(level_id).unique()
+        return index.unique(level=level_id)
 
     def _get_level_widget(self, level_id):
 
         level = self._get_available_index_level_values(level_id)
 
         # TODO mouseup callback policy
-        # seems currently broken in panel, undocumented value_throttle option that doens't do anything
+        # value_throttle is not updating, unlike mentioned in the doc, callback_policy is not a valid option
+        # TODO init value_throttled, dublicate options if only one
         #         if np.issubdtype(level, np.number):
         #             return pn.widgets.DiscreteSlider(name=level.name, value=level[0], options=level.tolist())
         #         else:
@@ -64,7 +68,7 @@ class DataHandler(param.Parameterized):
                 if len(idx) == 1:
                     idx = idx[0]
 
-                self.subdc = self.dc.lsc[idx].reset_index()
+                self.subdc = self.dc.lsc[idx]
 
         _widget_watcher()
 
