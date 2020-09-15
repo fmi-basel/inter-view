@@ -1,4 +1,5 @@
 import matplotlib.colors as colors
+import matplotlib.pyplot as plt
 from matplotlib import cm
 import colorcet as cc
 
@@ -77,3 +78,18 @@ cm.register_cmap(name='glasbey_hv',
 cm.register_cmap(name='blk_glasbey_hv',
                  cmap=colors.ListedColormap(blk_glasbey_hv,
                                             name='blk_glasbey_hv'))
+
+mesh_cmaps = [
+    colors.LinearSegmentedColormap.from_list('clipped_plasma',
+                                             plt.get_cmap('plasma')(
+                                                 range(230)),
+                                             N=256),
+    colors.LinearSegmentedColormap.from_list('clipped_plasma_r',
+                                             plt.get_cmap('plasma_r')(range(
+                                                 15, 256)),
+                                             N=256)
+]
+
+for cmap in mesh_cmaps:
+    if not isinstance(cmap, str):
+        cm.register_cmap(name=cmap.name, cmap=cmap)
