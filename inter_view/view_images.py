@@ -1,155 +1,405 @@
 import numpy as np
-
 import holoviews as hv
-
-from holoviews import opts
-
 import param
 import panel as pn
 
-from inter_view.utils import Slice, zoom_bounds_hook
+from skimage.exposure import rescale_intensity
+
+from holoviews import opts
+from holoviews.operation.datashader import rasterize
+
+from inter_view.color import available_cmaps
+from inter_view.utils import LastTap, blend_overlay
+
+# defines default options for all viewers
+opts.defaults(
+    opts.Image('channel',
+               frame_width=600,
+               invert_yaxis=True,
+               xaxis='bare',
+               yaxis='bare',
+               bgcolor='black',
+               active_tools=['pan', 'wheel_zoom'],
+               show_title=False),
+    opts.RGB('composite',
+             frame_width=600,
+             invert_yaxis=True,
+             xaxis='bare',
+             yaxis='bare',
+             bgcolor='black',
+             active_tools=['pan', 'wheel_zoom'],
+             show_title=False),
+    opts.HLine('orthoview',
+               line_dash='dashed',
+               line_width=1,
+               line_color='white'),
+    opts.VLine('orthoview',
+               line_dash='dashed',
+               line_width=1,
+               line_color='white'),
+    opts.Overlay('orthoview', shared_axes=False, show_title=False),
+    opts.Overlay('segmentation', show_title=False),
+    opts.Image('segmentation',
+               frame_width=600,
+               invert_yaxis=True,
+               xaxis='bare',
+               yaxis='bare',
+               bgcolor='black',
+               active_tools=['pan', 'wheel_zoom'],
+               show_title=False),
+)
 
 
-class SliceViewer(param.Parameterized):
-    '''Turns a gridded dataset into hv.Image with a slider for the requested axis'''
-
+class BaseViewer(param.Parameterized):
     return_panel = param.Boolean(
         False,
         doc=
         """Returns a dynamic map if False (default) or directly a layout if True"""
     )
 
-    def __init__(self, axis='z', *args, **kwargs):
-        super().__init__(*args, **kwargs)
+    def __call__(self, dmap):
 
-        self.slicer = Slice(axis=axis)
-        self.initialized = False
-
-    def reset(self):
-        self.initialized = False
-        self.slicer.reset()
-
-    def __call__(self, ds):
-        ds = self.slicer(ds)
-
-        # maintain static/dynamic behavior
-        if isinstance(ds, hv.DynamicMap):
-            dmap = hv.util.Dynamic(ds, operation=self._dynamic_call)
-        else:
-            dmap = self._dynamic_call(ds)
-
-        if not self.initialized:
-            self.initialized = True
-
-            # add tap stream to watch last clicked position
-            self.tap = hv.streams.SingleTap(transient=True, source=dmap)
+        dmap = self._call(dmap)
 
         if self.return_panel:
             return self.panel(dmap)
         else:
             return dmap
 
-    def _dynamic_call(self, ds):
-        if len(ds.vdims) == 3:
-            hvimg = ds.to(hv.RGB)
-        else:
-            hvimg = ds.to(hv.Image)
+    def _call(self, dmap):
+        pass
 
-        xaxis_vals = hvimg.dimension_values(hvimg.kdims[0].name)
-        yaxis_vals = hvimg.dimension_values(hvimg.kdims[1].name)
-        bounds = (xaxis_vals.min(), yaxis_vals.min(), xaxis_vals.max(),
-                  yaxis_vals.max())
-
-        hvimg.opts(hooks=[zoom_bounds_hook(bounds)])
-
-        return hvimg
+    def widgets(self):
+        pass
 
     def panel(self, dmap):
-        return pn.Column(dmap, self.slicer.widget)
+        return pn.Row(dmap, self.widgets())
 
 
-class OrthoViewer(param.Parameterized):
-    return_panel = param.Boolean(
-        False,
+class ChannelViewer(BaseViewer):
+
+    cmap = param.Selector(list(available_cmaps.keys()), doc='Colormap name')
+    # actual colormap, needed to handle named colormaps and instances of colormap
+    _cmap = param.Parameter(next(iter(available_cmaps.values())))
+    intensity_bounds = param.Range(
         doc=
-        """Returns a dynamic map if False (default) or directly a layout if True"""
+        'Image clipping bounds. If not specified, imgae (min,max) will be used'
     )
-    ref_width = param.Integer(500, doc="""width of xy panel""")
-    navigaton_on = param.Boolean(True)
-    axiswise = param.Boolean(True)
+    slider_limits = param.NumericTuple(
+        (0, 2**16 - 1), doc='(min,max) values for intensity slider')
+    opacity = param.Number(1.,
+                           bounds=(0., 1.),
+                           step=0.01,
+                           doc='Channel opacity',
+                           instantiate=True)
+    bitdepth = param.Selector(
+        default=8,
+        objects=[8, 16, 'int8', 'int16'],
+        doc=
+        'bitdepth of the rasterized image. 16 bits is useful for labels with object above 255'
+    )
+    raster_aggregator = param.String(
+        'default',
+        doc=
+        'Aggreation method to downsample the image. e.g. use "first" for labels'
+    )
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._set_intensity_bounds_limits(self.slider_limits)
+        self._watch_selected_cmap()
+
+    @param.depends('cmap', watch=True)
+    def _watch_selected_cmap(self):
+        self._cmap = available_cmaps[self.cmap]
+
+    def _set_intensity_bounds_limits(self, limits):
+        '''Updates the bounds of intensity slider and change current value if out of bound'''
+
+        if self.intensity_bounds and self.intensity_bounds[1] > limits[1]:
+            self.intensity_bounds = (self.intensity_bounds[0], limits[1])
+
+        elif self.intensity_bounds and self.intensity_bounds[0] < limits[0]:
+            self.intensity_bounds = (limits[0], self.intensity_bounds[1])
+
+        self.param.intensity_bounds.bounds = limits
+
+    @param.depends('intensity_bounds')
+    def _update_intensity_bounds(self, elem):
+
+        xs = elem.dimension_values(0, expanded=False)
+        ys = elem.dimension_values(1, expanded=False)
+        img = elem.dimension_values(2, flat=False)
+        dtype = {
+            8: np.uint8,
+            16: np.uint16,
+            'int8': np.int8,
+            'int16': np.int16
+        }[self.bitdepth]
+
+        bounds = self.intensity_bounds
+        if bounds is None:
+            bounds = (img.min(), img.max())
+
+        img = rescale_intensity(img, in_range=bounds,
+                                out_range=dtype).astype(dtype)
+
+        return elem.clone((xs, ys, img))
+
+    @param.depends()
+    def _set_aspect_ratio(self, elem):
+        # hack to avoid bug with rasterize + invert_yaxis + aspect='equal'
+        # manually set data_aspect=1
+
+        options = elem.opts.get().options
+        frame_w = options.get('frame_width', None)
+        frame_h = options.get('frame_height', None)
+
+        if frame_w and frame_h:
+            # already set
+            return elem
+
+        wstart, wstop = elem.dimension_values(0, expanded=False)[[0, -1]]
+        hstart, hstop = elem.dimension_values(1, expanded=False)[[0, -1]]
+
+        w = wstop - wstart
+        h = hstop - hstart
+
+        if frame_w:
+            return elem.opts(
+                opts.Image(frame_height=int(round(frame_w / w * h))))
+        elif frame_h:
+            return elem.opts(
+                opts.Image(frame_width=int(round(frame_h / h * w))))
+        else:
+            return elem
+
+    def _call(self, dmap):
+        dmap = dmap.apply(lambda ds: ds.to(hv.Image, group='channel'))
+        dmap = rasterize(dmap, aggregator=self.raster_aggregator, expand=False)
+        dmap = dmap.apply(self._set_aspect_ratio)
+        dmap = dmap.apply(self._update_intensity_bounds)
+        return dmap.apply.opts(cmap=self.param._cmap, alpha=self.param.opacity)
+
+    def widgets(self):
+        return pn.WidgetBox(self.param.cmap, self.param.intensity_bounds,
+                            self.param.opacity)
+
+
+class OverlayViewer(BaseViewer):
+
+    channel_viewers = param.Dict({})
+
+    def _call(self, dmaps):
+
+        if len(dmaps) != len(self.channel_viewers):
+            raise ValueError(
+                'the number of dmaps does not match the number of channel viewers: {} vs. {}'
+                .format(len(dmaps), len(self.channel_viewers)))
+
+        dmaps = [
+            v(dmap) for v, dmap in zip(self.channel_viewers.values(), dmaps)
+        ]
+
+        return hv.Overlay(dmaps).collate()
+
+    def widgets(self):
+        tabs = pn.Tabs()
+        tabs.extend([(str(key), val.widgets())
+                     for key, val in self.channel_viewers.items()])
+        return tabs
+
+    @classmethod
+    def from_channel_config(cls, channel_config, *args, **kwars):
+
+        #         {1:{'label':'marker1','cmap':'cyan','intensity_bounds':(0,4000), 'slider_limits':(0,10000)},
+        #          2:{'label':'marker2','cmap':'magenta','intensity_bounds':(1000,6000), 'slider_limits':(0,30000)},
+        #          4:{'label':'marker4','cmap':'yellow','intensity_bounds':(0,4000), 'slider_limits':(0,10000)}}
+
+        # get valid channel viewer options
+        viewer_options = [
+            key for key, val in ChannelViewer.__dict__.items()
+            if isinstance(val, param.Parameter)
+        ]
+        viewers = {}
+
+        for viewer_key, config in channel_config.items():
+            config = {
+                key: val
+                for key, val in config.items() if key in viewer_options
+            }
+            viewers[viewer_key] = ChannelViewer(**config)
+
+        return cls(channel_viewers=viewers, *args, **kwars)
+
+
+class CompositeViewer(OverlayViewer):
+    def _call(self, dmaps):
+        overlay = super()._call(dmaps)
+        overlay = overlay.apply(blend_overlay)
+
+        return overlay
+
+
+class SegmentationViewer(OverlayViewer):
+    '''Mix a composite channel for the raw images and individual channels overlay for segmentation'''
+
+    composite_channels = param.List(
+        doc='ids of channels to be displayed as color composite')
+    overlay_channels = param.List(
+        doc='ids of channels to be displayed as overlay on top of the composite'
+    )
+
+    def _call(self, dmaps):
+
+        # NOTE: workaround to overlay drawingtool. does not work if overlayed after Overlay + collate
+        # similar to reported holoviews bug. tap stream attached to a dynamic map does not update
+        # https://github.com/holoviz/holoviews/issues/3533
+        extra_overlays = dmaps[len(self.channel_viewers):]
+
+        out_dmaps = []
+
+        if self.composite_channels:
+            composite_dmaps = [
+                ch_viewer(dmap)
+                for (key, ch_viewer
+                     ), dmap in zip(self.channel_viewers.items(), dmaps)
+                if key in self.composite_channels
+            ]
+            if len(composite_dmaps) > 0:
+                composite_dmap = hv.Overlay(composite_dmaps).collate()
+                out_dmaps.append(composite_dmap.apply(blend_overlay))
+
+        if self.overlay_channels:
+            out_dmaps.extend([
+                ch_viewer(dmap)
+                for (key, ch_viewer
+                     ), dmap in zip(self.channel_viewers.items(), dmaps)
+                if key in self.overlay_channels
+            ])
+
+        out_dmaps.extend(extra_overlays)
+
+        return hv.Overlay(out_dmaps).collate().relabel(group='segmentation')
+
+
+class SliceViewer(BaseViewer):
+    '''Slices hv.Dataset along the specified axis.'''
+
+    slice_id = param.ObjectSelector(default=0, objects=[0])
+    axis = param.String(default='z')
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
 
-        self.z_viewer = SliceViewer(axis='z')
-        self.x_viewer = SliceViewer(axis='x')
-        self.y_viewer = SliceViewer(axis='y')
+        self.param.slice_id.label = self.axis
+        self._widget = pn.Param(self.param.slice_id,
+                                widgets={
+                                    'slice_id': {
+                                        'type': pn.widgets.DiscreteSlider,
+                                        'formatter': '%.2g',
+                                        'sizing_mode': 'stretch_width'
+                                    }
+                                })[0]
 
-        self.initialized = False
+    def update_slider_coords(self, element):
+        coords = element.dimension_values(self.axis, expanded=False)
+        self.param.slice_id.objects = coords
+        self.slice_id = coords[len(coords) // 2]
 
-    def reset(self):
-        self.initialized = False
-        self.z_viewer.reset()
-        self.x_viewer.reset()
-        self.y_viewer.reset()
+    def _find_nearest_value(self, array, value):
+        array = np.asarray(array)
+        idx = (np.abs(array - value)).argmin()
+        return array[idx]
 
-    def __call__(self, ds):
-        img_xy = self.z_viewer(ds).opts(axiswise=self.axiswise,
-                                        invert_yaxis=True)
-        img_zy = self.x_viewer(ds).opts(axiswise=self.axiswise,
-                                        invert_yaxis=True,
-                                        invert_axes=False)
-        img_xz = self.y_viewer(ds).opts(axiswise=self.axiswise,
-                                        invert_yaxis=True)
+    def moveto(self, value):
+        '''Move slider to it's closest (discrete) position'''
 
+        discrete_values = self.param.slice_id.objects
+        self.slice_id = self._find_nearest_value(discrete_values, value)
+
+    @param.depends('slice_id', 'axis')
+    def _slice_volume(self, element):
         if not self.initialized:
+            self.update_slider_coords(element)
             self.initialized = True
-            self._update_ref_height()
-            self._init_crosshairs()
 
-        if self.return_panel:
-            return self.panel(img_xy, img_zy, img_xz)
-        else:
-            return img_xy, img_zy, img_xz
+        new_dims_name = [d.name for d in element.kdims if d.name != self.axis]
+        return element.select(**{
+            self.axis: self.slice_id
+        }).reindex(new_dims_name)
 
-    def _update_ref_height(self):
-        y_max = self.y_viewer.slicer.param.slice_id.objects.max()
-        x_max = self.x_viewer.slicer.param.slice_id.objects.max()
-        self.ref_height = int(round(self.ref_width * y_max / x_max))
+    def _call(self, dmap):
+        # reset slider range on first dynamic slice call
+        # slider values will corresponds to the last call (intendend for overlay, all dataset should have the same shape)
+        self.initialized = False
+        return dmap.apply(self._slice_volume)
 
-    def _init_crosshairs(self):
+    def widgets(self):
+        return self._widget
 
-        # vertical/horizontal orientation prior to switching axis
+    def panel(self, dmap):
+        return pn.Column(dmap, self.widgets())
 
-        self.xy_v = hv.VLine(self.x_viewer.slicer.widget.value,
+
+class OrthoViewer(BaseViewer):
+    '''Slices a 3D dataset along x,y and z axes and synchronizes the views.'''
+
+    navigaton_on = param.Boolean(True)
+    z_viewer = param.Parameter(SliceViewer(axis='z'))
+    x_viewer = param.Parameter(SliceViewer(axis='x'))
+    y_viewer = param.Parameter(SliceViewer(axis='y'))
+
+    xy_tap = param.Parameter(LastTap())
+    zy_tap = param.Parameter(LastTap())
+    xz_tap = param.Parameter(LastTap())
+
+    add_crosshairs = param.Boolean(True)
+
+    @param.depends()
+    def _invert_axes(self, elem):
+        # NOTE should use opts(invert_axes) instead but for some reason
+        # it fails after zooming or panning
+        return elem.reindex(elem.kdims[::-1])
+
+    def get_crosshair(self):
+        self.xy_v = hv.VLine(self.x_viewer._widget.value,
                              kdims=['x', 'y'],
-                             label='xyV').opts(axiswise=self.axiswise)
-        self.xy_h = hv.HLine(self.y_viewer.slicer.widget.value,
+                             label='xyV',
+                             group='orthoview')
+        self.xy_h = hv.HLine(self.y_viewer._widget.value,
                              kdims=['x', 'y'],
-                             label='xyH').opts(axiswise=self.axiswise)
+                             label='xyH',
+                             group='orthoview')
 
-        self._jslink_discrete_slider(self.x_viewer.slicer.widget, self.xy_v)
-        self._jslink_discrete_slider(self.y_viewer.slicer.widget, self.xy_h)
+        self.zy_v = hv.VLine(self.z_viewer._widget.value,
+                             kdims=['za', 'y'],
+                             label='zyV',
+                             group='orthoview')
+        self.zy_h = hv.HLine(self.y_viewer._widget.value,
+                             kdims=['za', 'y'],
+                             label='zyH',
+                             group='orthoview')
 
-        self.zy_v = hv.VLine(self.z_viewer.slicer.widget.value,
-                             kdims=['y', 'z'],
-                             label='zyV').opts(axiswise=self.axiswise)
-        self.zy_h = hv.HLine(self.y_viewer.slicer.widget.value,
-                             kdims=['y', 'z'],
-                             label='zyH').opts(axiswise=self.axiswise)
+        self.xz_v = hv.VLine(self.x_viewer._widget.value,
+                             kdims=['x', 'zb'],
+                             label='xzV',
+                             group='orthoview')
+        self.xz_h = hv.HLine(self.z_viewer._widget.value,
+                             kdims=['x', 'zb'],
+                             label='xzH',
+                             group='orthoview')
 
-        self._jslink_discrete_slider(self.z_viewer.slicer.widget, self.zy_v)
-        self._jslink_discrete_slider(self.y_viewer.slicer.widget, self.zy_h)
+        return [(self.xy_v, self.xy_h), (self.zy_v, self.zy_h),
+                (self.xz_v, self.xz_h)]
 
-        self.xz_v = hv.VLine(self.x_viewer.slicer.widget.value,
-                             kdims=['xb', 'zb'],
-                             label='xzV').opts(axiswise=self.axiswise)
-        self.xz_h = hv.HLine(self.z_viewer.slicer.widget.value,
-                             kdims=['xb', 'zb'],
-                             label='xzH').opts(axiswise=self.axiswise)
-
-        self._jslink_discrete_slider(self.x_viewer.slicer.widget, self.xz_v)
-        self._jslink_discrete_slider(self.z_viewer.slicer.widget, self.xz_h)
+    def _link_crosshairs(self):
+        self._jslink_discrete_slider(self.x_viewer._widget, self.xy_v)
+        self._jslink_discrete_slider(self.y_viewer._widget, self.xy_h)
+        self._jslink_discrete_slider(self.z_viewer._widget, self.zy_v)
+        self._jslink_discrete_slider(self.y_viewer._widget, self.zy_h)
+        self._jslink_discrete_slider(self.x_viewer._widget, self.xz_v)
+        self._jslink_discrete_slider(self.z_viewer._widget, self.xz_h)
 
     def _jslink_discrete_slider(self, widget, line):
         '''hack to jslink pn.widgets.DiscreteSlider to vertical/horizontal lines.
@@ -162,125 +412,70 @@ class OrthoViewer(param.Parameterized):
 
         return widget._slider.jslink(line, code={'value': code})
 
-    def _init_tap_navigator(self):
-        '''move to click position by changing sliders value'''
-        @param.depends(x1=self.z_viewer.tap.param.x,
-                       x2=self.y_viewer.tap.param.x,
-                       watch=True)
-        def update_x_slider(x1=None, x2=None):
-            x = x1 or x2
-            if self.navigaton_on and x is not None:
-                self.x_viewer.slicer.moveto(x)
-                # ~x_vals = self.x_viewer.slicer.param.slice_id.objects
-                # ~self.x_viewer.slicer.slice_id = self._find_nearest_value(x_vals, x)
+    @param.depends()
+    def _update_dynamic_values(self, xy, zy, xz):
+        '''render dummy plots to force updating the sliders, getting plot size, etc.'''
+        self.frame_y_size = hv.render(xy).frame_height
+        hv.render(zy)  # init slicer
+        self.frame_z_size = hv.render(xz).frame_height
 
-        @param.depends(y1=self.x_viewer.tap.param.y,
-                       y2=self.z_viewer.tap.param.y,
-                       watch=True)
-        def update_y_slider(y1=None, y2=None):
-            y = y1 or y2
-            if self.navigaton_on and y is not None:
-                self.y_viewer.slicer.moveto(y)
-                # ~y_vals = self.y_viewer.slicer.param.slice_id.objects
-                # ~self.y_viewer.slicer.slice_id = self._find_nearest_value(y_vals, y)
+    def _call(self, dmap):
+        dmap_xy = self.z_viewer(dmap)
+        dmap_zy = self.x_viewer(dmap).redim(z='za').apply(self._invert_axes)
+        dmap_xz = self.y_viewer(dmap).redim(z='zb')
 
-        @param.depends(z1=self.y_viewer.tap.param.y,
-                       z2=self.x_viewer.tap.param.x,
-                       watch=True)
-        def update_z_slider(z1=None, z2=None):
-            z = z1 or z2
-            if self.navigaton_on and z is not None:
-                self.z_viewer.slicer.moveto(z)
-                # ~z_vals = self.z_viewer.slicer.param.slice_id.objects
-                # ~self.z_viewer.slicer.slice_id = self._find_nearest_value(z_vals, z)
+        self._init_tap_navigator(dmap_xy, dmap_zy, dmap_xz)
 
-    def panel(self, img_xy, img_zy, img_xz):
+        return (dmap_xy, dmap_zy, dmap_xz)
 
-        self._init_tap_navigator()
+    @param.depends('xy_tap.c0', 'xy_tap.c1', watch=True)
+    def _update_xy_sliders(self):
+        if self.navigaton_on:
+            self.x_viewer.moveto(self.xy_tap.c0)
+            self.y_viewer.moveto(self.xy_tap.c1)
 
-        xy = (img_xy * self.xy_h * self.xy_v).opts(axiswise=self.axiswise)
-        zy = (img_zy * self.zy_h * self.zy_v).opts(axiswise=self.axiswise)
-        xz = (img_xz * self.xz_h * self.xz_v).opts(axiswise=self.axiswise)
+    @param.depends('zy_tap.c0', 'zy_tap.c1', watch=True)
+    def _update_zy_sliders(self):
+        if self.navigaton_on:
+            self.z_viewer.moveto(self.zy_tap.c0)
+            self.y_viewer.moveto(self.zy_tap.c1)
 
-        #         xy = (img_xy).opts(axiswise=False)
-        #         zy = (img_zy).opts(axiswise=False)
-        #         xz = (img_xz).opts(axiswise=False)
+    @param.depends('xz_tap.c0', 'xz_tap.c1', watch=True)
+    def _update_xz_sliders(self):
+        if self.navigaton_on:
+            self.x_viewer.moveto(self.xz_tap.c0)
+            self.z_viewer.moveto(self.xz_tap.c1)
 
-        xy.opts(
-            opts.Image(xaxis='bare', yaxis='bare', frame_width=self.ref_width))
+    def _init_tap_navigator(self, xy, zy, xz):
+        self.xy_tap(xy)
+        self.zy_tap(zy)
+        self.xz_tap(xz)
+
+    def panel(self, dmaps):
+        xy, zy, xz = dmaps
+
+        self._update_dynamic_values(xy, zy, xz)
         zy.opts(
-            opts.Image(xaxis='bare',
-                       yaxis='bare',
-                       frame_height=self.ref_height))
-        xz.opts(
-            opts.Image(xaxis='bare', yaxis='bare', frame_width=self.ref_width))
+            opts.Image(frame_width=self.frame_z_size,
+                       frame_height=self.frame_y_size),
+            opts.RGB(frame_width=self.frame_z_size,
+                     frame_height=self.frame_y_size),
+        )
 
-        # ~xy.opts(opts.Image(frame_width=self.ref_width))
-        # ~zy.opts(opts.Image(frame_height=self.ref_height))
-        # ~xz.opts(opts.Image(frame_width=self.ref_width))
+        if self.add_crosshairs:
+            self.get_crosshair()
+            panel_xy = self.z_viewer.panel(
+                (xy * self.xy_h * self.xy_v).relabel(group='orthoview'))
+            panel_zy = self.x_viewer.panel(
+                (zy * self.zy_h * self.zy_v).relabel(group='orthoview'))
+            panel_xz = self.y_viewer.panel(
+                (xz * self.xz_h * self.xz_v).relabel(group='orthoview'))
+        else:
+            panel_xy = self.z_viewer.panel(xy.relabel(group='orthoview'))
+            panel_zy = self.x_viewer.panel(zy.relabel(group='orthoview'))
+            panel_xz = self.y_viewer.panel(xz.relabel(group='orthoview'))
 
-        panel_xy = self.z_viewer.panel(xy)
-        panel_zy = self.x_viewer.panel(zy)
-        panel_xz = self.y_viewer.panel(xz)
+        self._link_crosshairs()
 
         return pn.Column(pn.Row(panel_xy, panel_zy),
                          pn.Row(panel_xz, self.param.navigaton_on))
-
-
-class OverlayViewer(param.Parameterized):
-    '''
-    
-    Note:
-    To handle mix overlay of hv.Image and hv.RGB, the input takes a list of dmaps and 
-    the result is returned as hv.Overlay (rather than hv.NdOverlay)'''
-
-    return_panel = param.Boolean(
-        False,
-        doc=
-        """Returns a dynamic map if False (default) or directly a layout if True"""
-    )
-    alphas = param.Dict({})
-
-    def __call__(self, dmaps):
-
-        linked_dmaps = []
-        for dmap in dmaps:
-            if not self.alphas.get(dmap.label, None):
-                self.alphas[dmap.label] = pn.widgets.FloatSlider(
-                    start=0, value=1, end=1, step=0.01, name=dmap.label)
-
-            self.alphas[dmap.label].jslink(dmap, value='glyph.global_alpha')
-
-            linked_dmaps.append(dmap)
-
-        dmap = hv.Overlay(linked_dmaps).collate()
-
-        if self.return_panel:
-            return self.panel(dmap)
-        else:
-            return dmap
-
-    def panel(self, dmap):
-        return pn.Column(dmap, self.widget())
-
-    @param.depends('alphas')
-    def widget(self):
-        return pn.WidgetBox('alpha',
-                            *[alpha for alpha in self.alphas.values()])
-
-
-# TODO adjusting image intensity range:
-# does not work for rgb --> seems no color mapping --> must reconstruct 32 bits iamge (rgba)
-
-# ~b = pn.widgets.IntRangeSlider(start=0, end=255, value=(0, 255), step=1)
-
-# ~code = '''glyph.color_mapper.high = source.value[1];
-# ~glyph.color_mapper.low = source.value[0]'''
-
-# ~b.jslink(hvimg, code={'value': code})
-
-# ~pn.Row(hvimg, b)
-
-# ~# convert holoviews to bokeh
-# ~renderer = hv.renderer('bokeh').instance(mode='server')
-# ~bokehfig = hv.render(hvimg)

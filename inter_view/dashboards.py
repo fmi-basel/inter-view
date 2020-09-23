@@ -1,366 +1,385 @@
 import numpy as np
+import os
 import pandas as pd
 import param
 import panel as pn
 import holoviews as hv
+from collections.abc import Iterable
 
 from holoviews import opts, dim
 from holoviews.streams import Selection1D
 from bokeh.models import HoverTool
 
-from inter_view.utils import label_cmap, split_element, rasterize_custom, zoom_bounds_hook
-from inter_view.view_images import SliceViewer, OverlayViewer, OrthoViewer
-from inter_view.edit_images import LabelEditor, FreehandEditor
-from inter_view.io import ImageHandler
-
-# TODO rename group according to plot (slice, orthoview, etc.) --> set option accordign to names
-
-opts.defaults(
-    opts.Points(
-        'props_scatter',
-        frame_width=600,
-        frame_height=600,
-        alpha=0.5,
-        size=5,
-        line_color=None,
-        nonselection_fill_alpha=0.3,
-        selection_line_color='black',
-        selection_line_alpha=1.,
-        active_tools=['wheel_zoom'],
-        colorbar_position='left',
-        title='',
-    ))
+from inter_view.utils import HvDataset  #, label_cmap, split_element, zoom_bounds_hook# rasterize_custom
+from inter_view.view_images import SliceViewer, OverlayViewer, OrthoViewer, CompositeViewer, SegmentationViewer
+from inter_view.edit_images import RoiEditor, EditableHvDataset, FreehandEditor
+from inter_view.io import DataLoader
 
 
-class SegmentationSliceDashBoard(param.Parameterized):
-    '''Dashboard to view segmentation results (raw + segm channels)'''
+class BaseImageDashBoard(DataLoader):
+    '''Base class to build image related dashboards.
+    
+    Maintains 2 counter attributes indicating whether partial dynamic 
+    updates are sufficient. Complete updates are considered necessary if
+    the image shape has changed (i.e. requires rebuilding a plot with new 
+    bounds, aspect ratio, etc) or if the multiselection as changed (e.g. 
+    a different set of channels is selected)'''
 
-    image_handler = param.Parameter()
-    slice_viewer = param.Parameter()
-    overlay_viewer = param.Parameter()
-    plot_width = param.Integer(500)
+    _dynamic_update_counter = param.Integer(0)
+    _complete_update_counter = param.Integer(0)
 
-    include_background = param.Boolean(
-        False,
-        doc=
-        """Whether the background should be considered as a normal label or transparent"""
-    )
+    _has_shape_changed = param.Boolean(True)
+    _has_multiselect_changed = param.Boolean(True)
 
-    def __init__(self, df, ch_col, raw, segm, *args, **kwargs):
+    _old_img_shape = param.Parameter((-1, ))
+    _old_multi_select_index = param.Parameter((-1, ))
+
+    def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
+        self._monitor_updates()
 
-        self.slice_viewer = SliceViewer()
-        self.overlay_viewer = OverlayViewer()
-
-        self.raw = raw
-        self.segm = segm
-        self.ch_col = ch_col
-
-        # keep rows with channels of interest
-        df = df[df.index.get_level_values(ch_col).isin([raw, segm])]
-
-        # keeps row only if raw-segm pair is available
-        df = pd.concat([
-            g
-            for _, g in df.groupby([n for n in df.index.names if n != ch_col])
-            if len(g) == 2
-        ])
-
-        self.image_handler = ImageHandler(df, ds_dims=[ch_col])
-
-    @param.depends('image_handler.load_count')
-    def plot_image(self):
-        self.slice_viewer.reset()
-
-        dmaps = split_element(self.image_handler.ds,
-                              self.ch_col,
-                              values=[self.raw, self.segm])
-
-        if len(dmaps[0].kdims) > 2:
-            dmaps = tuple(self.slice_viewer(dmap) for dmap in dmaps)
+    @staticmethod
+    def index_to_str(index):
+        '''Converts a tuple index to a string wit _ separators'''
+        if not isinstance(index, (tuple, list)):
+            return str(index)
         else:
-            dmaps = tuple(
-                hv.util.Dynamic(dmap, operation=lambda x: x.to(hv.Image)).
-                relabel(dmap.label) for dmap in dmaps)
+            index = map(str, index)
+            return '_'.join(index)
 
-        dmaps = tuple(rasterize_custom(dmap, [self.segm]) for dmap in dmaps)
-        dmaps = self.overlay_viewer(dmaps)
+    @param.depends('loaded_objects', watch=True)
+    def _monitor_updates(self):
+        # reset
+        self._has_shape_changed = False
+        self._has_multiselect_changed = False
 
-        hover = HoverTool(tooltips=[('label id', '@image')])
-        dmaps = dmaps.opts(
-            opts.Overlay(normalize=False),
-            opts.Image(data_aspect=1.,
-                       show_legend=False,
-                       normalize=False,
-                       xaxis='bare',
-                       yaxis='bare',
-                       cmap='greys_r',
-                       frame_width=self.plot_width),
-            opts.Overlay(show_title=False),
-            opts.Image(self.segm,
-                       cmap=label_cmap,
-                       clipping_colors={'min': (0, 0, 0, 0)},
-                       clim=(int(not self.include_background),
-                             len(label_cmap)),
-                       tools=[hover]),
-        )
+        # check shape of any loaded images (assume the rest is the same)
+        img_shape = next(iter(self.loaded_objects.values())).shape
 
-        return dmaps
+        # check multi selection has changed (e.g. different set of channels)
+        multi_select_index = self.multi_select_index()
+
+        if img_shape != self._old_img_shape:
+            self._old_img_shape = img_shape
+            self._has_shape_changed = True
+
+        if multi_select_index != self._old_multi_select_index:
+            self._old_multi_select_index = multi_select_index
+            self._has_multiselect_changed = True
+
+        if self._has_shape_changed or self._has_multiselect_changed:
+            self._complete_update_counter += 1
+        else:
+            self._dynamic_update_counter += 1
+
+
+class CompositeDashBoard(BaseImageDashBoard):
+    '''Dashboard to views 2D, multi-channel images as color composite.'''
+
+    channel_config = param.Dict({}, doc='dictionnary configuring each channel')
+    composite_viewer = param.Parameter(CompositeViewer())
+    hv_datasets = param.List()
+    slicer = param.Parameter(SliceViewer())
+
+    _widget_update_counter = param.Integer(0)
+
+    @param.depends('_dynamic_update_counter', watch=True)
+    def _dynamic_img_update(self):
+        for hv_ds, img in zip(self.hv_datasets, self.loaded_objects.values()):
+            hv_ds.img = img
+
+    @param.depends('_complete_update_counter')
+    def dmap(self):
+
+        if not self.composite_viewer.channel_viewers or self._has_multiselect_changed:
+            selected_channel_config = {
+                key: self.channel_config[key]
+                for key in self.loaded_objects.keys()
+            }
+            self.composite_viewer = CompositeViewer.from_channel_config(
+                selected_channel_config)
+            self._widget_update_counter += 1
+
+        self.hv_datasets = [
+            HvDataset(img=img, label=self.index_to_str(key))
+            for key, img in self.loaded_objects.items()
+        ]
+        dmaps = [hv_ds.dmap() for hv_ds in self.hv_datasets]
+
+        # apply slicer if 3d image
+        if next(iter(self.loaded_objects.values())).ndim > 2:
+            dmaps = [self.slicer(dmap) for dmap in dmaps]
+
+        dmap = self.composite_viewer(dmaps)
+
+        return dmap
+
+    @param.depends('_widget_update_counter')
+    def widgets(self):
+
+        wg = [super().widgets(), self.composite_viewer.widgets]
+        wg = list(filter(None, wg))
+        return pn.Column(*wg)
 
     def panel(self):
-
-        # evaluate image first, then alpha slider
-        hvimg = pn.panel(self.plot_image)
-        alphas_wg = pn.panel(self.overlay_viewer.widget)
-
-        # add z slider if 3D
-        if len(self.slice_viewer.slicer.param.slice_id.objects) > 1:
-            return pn.Row(
-                hvimg,
-                pn.Column(self.image_handler.widgetbox,
-                          self.slice_viewer.slicer.widget,
-                          alphas_wg)).servable()
+        if list(self.loaded_objects.values())[0].ndim > 2:
+            plot = self.slicer.panel(self.dmap)
         else:
-            return pn.Row(hvimg,
-                          pn.Column(self.image_handler.widgetbox,
-                                    alphas_wg)).servable()
+            plot = self.dmap
+
+        return pn.Row(plot, self.widgets)
 
 
-class SegmentationOrthoDashBoard(param.Parameterized):
-    '''Dashboard to view segmentation results (raw + segm channels)'''
+class ExportCallback(param.Parameterized):
+    '''Mixin class adding channel export callbacks'''
 
-    image_handler = param.Parameter()
-    ortho_viewer = param.Parameter()
-    overlay_viewer = param.Parameter()
-    plot_width = param.Integer(500)
-
-    include_background = param.Boolean(
-        False,
+    out_folder = param.Foldername('', doc='output folder')
+    export_funs = param.List(
         doc=
-        """Whether the background should be considered as a normal label or transparent"""
+        'list of callables with signature (path, imgs, cmaps, intensity_bounds, labels)'
     )
+    export_fun = param.ObjectSelector(doc='active export function')
+    export_viewers = param.Dict({})
 
-    def __init__(self,
-                 df,
-                 ch_col,
-                 raw,
-                 segm,
-                 spacing_col=None,
-                 *args,
-                 **kwargs):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        if not self.export_funs:
+            raise ValueError('At least one export function is required')
+        self.param.export_fun.objects = self.export_funs
+        self.export_fun = self.export_funs[0]
+
+    @staticmethod
+    def _validate_intensity_bounds(intensity_bounds, img):
+        if intensity_bounds is None:
+            return img.min(), img.max()
+        else:
+            return intensity_bounds
+
+    def _get_export_arguments(self):
+        imgs = list(self.loaded_objects.values())
+        labels = list(self.export_viewers.keys())
+        intensity_bounds = [
+            self._validate_intensity_bounds(v.intensity_bounds, img)
+            for v, img in zip(self.export_viewers.values(), imgs)
+        ]
+        cmaps = [v.cmap for v in self.export_viewers.values()]
+        in_path = self.subdf.iloc[0:1].dc.path.tolist()[0]
+        out_path = os.path.join(self.out_folder, os.path.basename(in_path))
+        return out_path, imgs, cmaps, intensity_bounds, labels
+
+    def _export_callback(self, event):
+        args = self._get_export_arguments()
+        self.export_fun(*args)
+
+    def _export_widgets(self):
+        export_button = pn.widgets.Button(name='export')
+        export_button.on_click(self._export_callback)
+        return pn.WidgetBox(
+            pn.Param(self.param.export_fun,
+                     widgets={'export_fun': {
+                         'name': ''
+                     }}), export_button)
+
+
+class CompositeExportDashBoard(CompositeDashBoard, RoiEditor, ExportCallback):
+    '''Extension of CompositeDashboard with figure export capabilities'''
+    @param.depends('_complete_update_counter')
+    def dmap(self):
+        dmap = super().dmap()
+        self.export_viewers = self.composite_viewer.channel_viewers
+
+        return dmap * self.roi_plot
+
+    def _get_export_arguments(self):
+        out_path, imgs, cmaps, intensity_bounds, labels = super(
+        )._get_export_arguments()
+
+        if imgs[0].ndim > 2:
+            axis = {'z': 0, 'y': 1, 'x': 2}[self.slicer.axis]
+            imgs = [
+                np.take(img, self.slicer.slice_id, axis=axis) for img in imgs
+            ]
+            pre, ext = os.path.splitext(out_path)
+            out_path = pre + '_z{}'.format(self.slicer.slice_id) + ext
+
+        # crop images if roi available and add roi bounds to filename
+        loc = self.img_slice()
+        if loc is not None:
+            # only exports first roi
+            loc = loc[0]
+            imgs = [img[loc] for img in imgs]
+            pre, ext = os.path.splitext(out_path)
+            roi_bounds = (loc[1].start, loc[1].stop, loc[0].start, loc[0].stop)
+            out_path = pre + '_roi_{}_{}_{}_{}'.format(*roi_bounds) + ext
+
+        return out_path, imgs, cmaps, intensity_bounds, labels
+
+    @param.depends('_complete_update_counter')
+    def widgets(self):
+        wg = [super().widgets(), self._export_widgets()]
+        return pn.Column(*wg)
+
+
+class SegmentationDashBoard(BaseImageDashBoard):
+    '''Dashboard to views 2D, multi-channel images as color composite.'''
+
+    channel_config = param.Dict({}, doc='dictionnary configuring each channel')
+    composite_channels = param.List(
+        doc='ids of channels to be displayed as color composite')
+    overlay_channels = param.List(
+        doc='ids of channels to be displayed as overlay on top of the composite'
+    )
+    segmentation_viewer = param.Parameter(SegmentationViewer())
+    hv_datasets = param.List()
+    slicer = param.Parameter(SliceViewer())
+
+    _widget_update_counter = param.Integer(0)
+
+    def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
 
-        self.ortho_viewer = OrthoViewer(ref_width=self.plot_width)
-        self.overlay_viewer = OverlayViewer()
+    @param.depends('_dynamic_update_counter', watch=True)
+    def _dynamic_img_update(self):
+        for hv_ds, img in zip(self.hv_datasets, self.loaded_objects.values()):
+            hv_ds.img = img
 
-        self.raw = raw
-        self.segm = segm
-        self.ch_col = ch_col
+    @param.depends('_complete_update_counter')
+    def dmap(self):
 
-        # keep rows with channels of interest
-        df = df[df.index.get_level_values(ch_col).isin([raw, segm])]
+        if not self.segmentation_viewer.channel_viewers or self._has_multiselect_changed:
+            selected_channel_config = {
+                key: self.channel_config[key]
+                for key in self.loaded_objects.keys()
+            }
+            self.segmentation_viewer = SegmentationViewer.from_channel_config(
+                selected_channel_config,
+                composite_channels=self.composite_channels,
+                overlay_channels=self.overlay_channels)
+            self._widget_update_counter += 1
 
-        # keeps row only if raw-segm pair is available
-        df = pd.concat([
-            g
-            for _, g in df.groupby([n for n in df.index.names if n != ch_col])
-            if len(g) == 2
-        ])
+        self.hv_datasets = [
+            HvDataset(img=img, label=self.index_to_str(key))
+            for key, img in self.loaded_objects.items()
+        ]
+        dmaps = [hv_ds.dmap() for hv_ds in self.hv_datasets]
 
-        self.image_handler = ImageHandler(df,
-                                          ds_dims=[ch_col],
-                                          spacing_col=spacing_col)
+        # apply slicer if 3d image
+        if next(iter(self.loaded_objects.values())).ndim > 2:
+            dmaps = [self.slicer(dmap) for dmap in dmaps]
 
-        hover = HoverTool(tooltips=[('label id', '@image')])
+        dmap = self.segmentation_viewer(dmaps)
 
-        opts.defaults(
-            opts.Overlay(normalize=False),
-            opts.Image('Image.{}'.format(raw),
-                       data_aspect=1.,
-                       cmap='greys_r',
-                       show_legend=False,
-                       bgcolor='black'),
-            opts.HLine(line_dash='dashed', line_width=2, line_color='white'),
-            opts.VLine(line_dash='dashed', line_width=2, line_color='white'),
-            opts.Image('Image.{}'.format(segm),
-                       data_aspect=1.,
-                       cmap=label_cmap,
-                       show_legend=False,
-                       clipping_colors={'min': (0, 0, 0, 0)},
-                       clim=(int(not self.include_background),
-                             len(label_cmap)),
-                       tools=[hover],
-                       bgcolor='black'))
+        return dmap
 
-    @param.depends('image_handler.load_count')
-    def plot_orthoview(self):
-        self.ortho_viewer.reset()
+    @param.depends('_widget_update_counter')
+    def widgets(self):
 
-        dmaps = split_element(self.image_handler.ds,
-                              self.ch_col,
-                              values=[self.raw, self.segm])
-
-        ortho_dmaps = tuple(self.ortho_viewer(dmap) for dmap in dmaps)
-        ortho_dmaps = tuple(
-            tuple(rasterize_custom(dmap, [self.segm]) for dmap in dmaps)
-            for dmaps in ortho_dmaps)
-
-        # swap orthoview and overlay dimensions
-        ortho_dmaps = tuple(zip(*ortho_dmaps))
-
-        ortho_dmaps = tuple(
-            self.overlay_viewer(dmaps) for dmaps in ortho_dmaps)
-
-        l = self.ortho_viewer.panel(*ortho_dmaps)
-        l[1][1] = pn.Column(self.image_handler.widgetbox,
-                            self.overlay_viewer.widget)
-
-        return l
+        wg = [super().widgets(), self.segmentation_viewer.widgets]
+        wg = list(filter(None, wg))
+        return pn.Column(*wg)
 
     def panel(self):
-        return pn.panel(self.plot_orthoview).servable()
-
-
-class AnnotationDashBoard(param.Parameterized):
-    '''Dashboard to view segmentation results (raw + segm channels)'''
-
-    image_handler = param.Parameter()
-    slice_viewer = param.Parameter()
-    overlay_viewer = param.Parameter()
-    label_editor = param.Parameter()
-    freehand_editor = param.Parameter()
-    loaded_subdc = param.DataFrame()
-
-    include_background = param.Boolean(
-        False,
-        doc=
-        """Whether the background should be considered as a normal label or transparent"""
-    )
-    cmap = param.Parameter(label_cmap, precedence=-1)
-    discarding = param.Boolean(False)
-
-    plot_width = param.Integer(500)
-
-    def __init__(self,
-                 df,
-                 ch_col,
-                 raw,
-                 segm,
-                 spacing_col=None,
-                 *args,
-                 **kwargs):
-        super().__init__(*args, **kwargs)
-
-        self.slice_viewer = SliceViewer()
-        self.overlay_viewer = OverlayViewer()
-        self.label_editor = LabelEditor()
-        self.freehand_editor = FreehandEditor(label_editor=self.label_editor,
-                                              plot_width=self.plot_width)
-
-        self.raw = raw
-        self.segm = segm
-        self.ch_col = ch_col
-
-        # keep rows with channels of interest
-        df = df[df.index.get_level_values(ch_col).isin([raw, segm])]
-
-        # keeps row only if raw-segm pair is available
-        df = pd.concat([
-            g
-            for _, g in df.groupby([n for n in df.index.names if n != ch_col])
-            if len(g) == 2
-        ])
-
-        self.image_handler = ImageHandler(df,
-                                          ds_dims=[ch_col],
-                                          spacing_col=spacing_col)
-
-        if not self.include_background:
-            self.cmap = self.cmap[1:]
-
-    @param.depends('image_handler.load_count')
-    def plot_image(self):
-        self.freehand_editor.reset()
-
-        # save previous image
-        if self.loaded_subdc is not None and not self.discarding:
-            self.save_annot()
-
-        self.discarding = False
-
-        # don't reset the slider if reloading the same image
-        if self.loaded_subdc is None or not self.loaded_subdc.equals(
-                self.image_handler.subdc):
-            self.slice_viewer.reset()
-
-        self.loaded_subdc = self.image_handler.subdc
-
-        raw_ds, segm_ds = split_element(self.image_handler.ds,
-                                        self.ch_col,
-                                        values=[self.raw, self.segm])
-
-        # extract data array in label editor
-        segm_dmap = self.label_editor(segm_ds)
-        #add drawing tool
-        segm_dmap = self.freehand_editor(
-            segm_dmap,
-            slicing_info=lambda: (0, self.slice_viewer.slicer.slice_id))
-        #         dmaps = self.slice_viewer(segm_dmap) * self.freehand_editor.drawingtool
-
-        if len(segm_ds.kdims) > 2:
-            dmaps = tuple(
-                self.slice_viewer(dmap) for dmap in (raw_ds, segm_dmap))
+        if list(self.loaded_objects.values())[0].ndim > 2:
+            plot = self.slicer.panel(self.dmap)
         else:
-            dmaps = tuple(
-                hv.util.Dynamic(dmap, operation=lambda x: x.to(hv.Image))
-                for dmap in (raw_ds, segm_dmap))
+            plot = self.dmap
 
-        dmaps = tuple(rasterize_custom(dmap, [self.segm]) for dmap in dmaps)
-        dmaps = self.overlay_viewer(dmaps)
+        return pn.Row(plot, self.widgets)
 
-        dmaps = dmaps * self.freehand_editor.drawingtool
 
-        dmaps = dmaps.opts(
-            opts.Image(data_aspect=1,
-                       show_legend=False,
-                       normalize=False,
-                       xaxis='bare',
-                       yaxis='bare',
-                       cmap='greys_r',
-                       frame_width=self.plot_width),
-            opts.Overlay(show_title=False, normalize=False),
-            opts.Image(self.segm,
-                       cmap=self.cmap,
-                       clipping_colors={'min': (0, 0, 0, 0)},
-                       clim=(int(not self.include_background),
-                             len(self.cmap))),
-        )
+# TODO
+# - test on images of the same size
+# - test with spacing != 1
+# - fix + test 3D img
+# - 3D drawing thickness
+# - demo/test notebook
 
-        # prevent from zooming outside of image
-        # TODO automatically adjust as function of slicing axis
-        xaxis_vals = raw_ds.dimension_values('x')
-        yaxis_vals = raw_ds.dimension_values('y')
-        bounds = (xaxis_vals.min(), yaxis_vals.min(), xaxis_vals.max(),
-                  yaxis_vals.max())
 
-        dmaps = dmaps.opts(hooks=[zoom_bounds_hook(bounds)])
+class AnnotationDashBoard(SegmentationDashBoard):
 
-        return dmaps
+    annot_channel = param.Parameter(doc='id of annotation channel')
+    freehand_editor = param.Parameter(FreehandEditor())
+    old_subdf = param.DataFrame()
+
+    def _make_dataset(self, key, img):
+        if key == self.annot_channel:
+            annot_dataset = EditableHvDataset(img=img,
+                                              label=self.index_to_str(key))
+            # force reset drawing tool axis
+            self.freehand_editor = FreehandEditor(dataset=annot_dataset)
+            return annot_dataset
+        else:
+            return HvDataset(img=img, label=self.index_to_str(key))
+
+    # NOTE overriding base class --> watch=True not needed (else triggers double update)
+    @param.depends('_dynamic_update_counter')
+    def _dynamic_img_update(self):
+        self.save_annot()
+
+        for hv_ds, img in zip(self.hv_datasets, self.loaded_objects.values()):
+            hv_ds.img = img
+
+    @param.depends('_complete_update_counter')
+    def dmap(self):
+        self.save_annot()
+
+        if not self.segmentation_viewer.channel_viewers or self._has_multiselect_changed:
+            selected_channel_config = {
+                key: self.channel_config[key]
+                for key in self.loaded_objects.keys()
+            }
+            self.segmentation_viewer = SegmentationViewer.from_channel_config(
+                selected_channel_config,
+                composite_channels=self.composite_channels,
+                overlay_channels=self.overlay_channels)
+            self._widget_update_counter += 1
+
+        self.hv_datasets = [
+            self._make_dataset(key, img)
+            for key, img in self.loaded_objects.items()
+        ]
+        dmaps = [hv_ds.dmap() for hv_ds in self.hv_datasets]
+
+        # apply slicer if 3d image
+        if next(iter(self.loaded_objects.values())).ndim > 2:
+            dmaps = [self.slicer(dmap) for dmap in dmaps]
+
+        # NOTE: workaround to overlay drawingtool. does not work if overlayed after Overlay + collate
+        # similar to reported holoviews bug. tap stream attached to a dynamic map does not update
+        # https://github.com/holoviz/holoviews/issues/3533
+        dmaps.append(self.freehand_editor.path_plot)
+        dmap = self.segmentation_viewer(dmaps)
+
+        # Note
+        # dmap * self.freehand_editor.path_plot does not work (no drawing tool available)
+        # self.freehand_editor.path_plot * dmap works but path is drawn behind the image
+        return dmap
 
     def save_annot(self, event=None):
-        npimg = self.label_editor.array.astype(np.int16)
-        print('saving {}'.format(
-            self.loaded_subdc.set_index(
-                self.ch_col).lsc[self.segm].lsc.path[0]))
-        self.loaded_subdc.set_index(self.ch_col).lsc[self.segm].lsc.write(
-            npimg,
-            compressed=False)  # compression does not handle negative label
+        npimg = self.freehand_editor.dataset.img.astype(np.int16)
+        if npimg.shape != (2, 2) and self.old_subdf is not None:
+            single_index = list(
+                set(self.old_subdf.index.names) -
+                set(self.multi_select_levels))
+            row = self.old_subdf.reset_index(single_index).dc[
+                self.annot_channel]
+            row.dc.write(npimg, compress=9)
 
     def discard_changes(self, event=None):
-        self.discarding = True
-        self.image_handler.update_ds()
 
-    def panel(self):
+        single_index = list(
+            set(self.old_subdf.index.names) - set(self.multi_select_levels))
+        row = self.old_subdf.reset_index(single_index).dc[self.annot_channel]
+        img = row.dc.read()[0]
+
+        self.freehand_editor.dataset.img = img
+
+    @param.depends('subdf', watch=True)
+    def _backup_subdf(self):
+        self.old_subdf = self.subdf
+
+    def widgets(self):
+        wg = super().widgets()
 
         save_button = pn.widgets.Button(name='save')
         save_button.on_click(self.save_annot)
@@ -368,25 +387,105 @@ class AnnotationDashBoard(param.Parameterized):
         discard_button = pn.widgets.Button(name='discard changes')
         discard_button.on_click(self.discard_changes)
 
-        # evaluate image first, then alpha slider
-        hvimg = pn.panel(self.plot_image)
-        alphas_wg = pn.panel(self.overlay_viewer.widget)
+        edit_wg = self.freehand_editor.widgets()
+        edit_wg.append(save_button)
+        edit_wg.append(discard_button)
 
-        ih_widgets = self.image_handler.widgetbox
-        ih_widgets.append(save_button)
-        ih_widgets.append(discard_button)
+        return pn.Column(wg, edit_wg)
 
-        # add z slider if 3D
-        if len(self.slice_viewer.slicer.param.slice_id.objects) > 1:
-            return pn.Row(
-                pn.Column(hvimg, self.slice_viewer.slicer.widget),
-                pn.Column(ih_widgets, alphas_wg, self.label_editor.widgets,
-                          self.freehand_editor.widgets)).servable()
-        else:
-            return pn.Row(
-                pn.Column(hvimg),
-                pn.Column(ih_widgets, alphas_wg, self.label_editor.widgets,
-                          self.freehand_editor.widgets)).servable()
+
+class OrthoSegmentationDashBoard(BaseImageDashBoard):
+    '''Dashboard to views 2D, multi-channel images as color composite.'''
+
+    channel_config = param.Dict({}, doc='dictionnary configuring each channel')
+    composite_channels = param.List(
+        doc='ids of channels to be displayed as color composite')
+    overlay_channels = param.List(
+        doc='ids of channels to be displayed as overlay on top of the composite'
+    )
+    segmentation_viewer = param.Parameter(SegmentationViewer())
+    hv_datasets = param.List()
+    ortho_viewer = param.Parameter(OrthoViewer(add_crosshairs=False))
+    spacing = param.Parameter((1, ), doc='pixel/voxel size', precedence=-1)
+
+    last_clicked_position = param.Array(np.array([]))
+
+    _widget_update_counter = param.Integer(0)
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+
+    @param.depends('ortho_viewer.z_viewer.slice_id',
+                   'ortho_viewer.y_viewer.slice_id',
+                   'ortho_viewer.x_viewer.slice_id',
+                   watch=True)
+    def watch_position(self):
+        z = self.ortho_viewer.z_viewer.slice_id
+        y = self.ortho_viewer.y_viewer.slice_id
+        x = self.ortho_viewer.x_viewer.slice_id
+
+        pos = np.array(np.array((z, y, x)) / self.spacing)
+        self.last_clicked_position = np.round(pos).astype(int)
+
+    @param.depends('_dynamic_update_counter', watch=True)
+    def _dynamic_img_update(self):
+        for hv_ds, img in zip(self.hv_datasets, self.loaded_objects.values()):
+            hv_ds.img = img
+
+    def dmap(self):
+
+        if not self.segmentation_viewer.channel_viewers or self._has_multiselect_changed:
+            selected_channel_config = {
+                key: self.channel_config[key]
+                for key in self.loaded_objects.keys()
+            }
+            self.segmentation_viewer = SegmentationViewer.from_channel_config(
+                selected_channel_config,
+                composite_channels=self.composite_channels,
+                overlay_channels=self.overlay_channels)
+            self._widget_update_counter += 1
+
+        self.hv_datasets = [
+            HvDataset(img=img,
+                      label=self.index_to_str(key),
+                      spacing=self.spacing)
+            for key, img in self.loaded_objects.items()
+        ]
+        dmaps = [hv_ds.dmap() for hv_ds in self.hv_datasets]
+
+        dmaps = [self.ortho_viewer(dmap) for dmap in dmaps]
+
+        # invert slices and channels
+        dmaps = list(zip(*dmaps))
+
+        # add crosshair overlay, bug if adding to an existing overlay
+        cross = self.ortho_viewer.get_crosshair()
+        dmaps = [dmap + cr for dmap, cr in zip(dmaps, cross)]
+
+        dmaps = [self.segmentation_viewer(dmap) for dmap in dmaps]
+
+        return dmaps
+
+    @param.depends('_widget_update_counter')
+    def widgets(self):
+
+        wg = [super().widgets(), self.segmentation_viewer.widgets]
+        wg = list(filter(None, wg))
+        return pn.Column(*wg)
+
+    @param.depends('_complete_update_counter')
+    def _rebuild_panel(self):
+        self.ortho_viewer = OrthoViewer(add_crosshairs=False)
+
+        panel = self.ortho_viewer.panel(self.dmap())
+
+        # add the composite viewer above the orthoview widget (navigation checkbox)
+        panel[1][1] = pn.Column(self.widgets(), panel[1][1])
+
+        return panel
+
+    def panel(self):
+        return pn.Row(self._rebuild_panel)
 
 
 class ScatterDashBoard(param.Parameterized):
@@ -396,6 +495,7 @@ class ScatterDashBoard(param.Parameterized):
     x_key = param.Selector()
     y_key = param.Selector()
     color_key = param.Selector()
+    hover_keys = param.List()
 
     props = param.DataFrame(pd.DataFrame())
 
@@ -444,16 +544,9 @@ class ScatterDashBoard(param.Parameterized):
 
     @param.depends('x_key', 'y_key', 'color_key', 'selection_ids')
     def plot_scatter(self):
-
-        tooltips = [
-            ('bloc id', '@bloc_id'),
-            ('cell type', '@cell_type'),
-            ('nucleus id', '@nucleus_id'),
-        ]
-        hover = HoverTool(tooltips=tooltips)
-
         points = hv.Points(self.props,
                            kdims=[self.x_key, self.y_key],
+                           vdims=self.hover_keys + [self.color_key],
                            group='props_scatter')
 
         # change colormap for categorical values
@@ -474,7 +567,7 @@ class ScatterDashBoard(param.Parameterized):
             color_levels=color_levels,
             cmap=cmap,
             colorbar=colorbar,
-            tools=[hover, 'box_select', 'lasso_select', 'tap'],
+            tools=['hover', 'box_select', 'lasso_select', 'tap'],
         )
 
         # add selection stream and attach callback to update sample/image selection

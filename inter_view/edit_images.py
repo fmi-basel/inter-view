@@ -7,116 +7,129 @@ import holoviews as hv
 from holoviews import streams, opts
 
 from inter_view.utils import label_cmap
+from inter_view.utils import HvDataset
+from inter_view.color import glasbey_hv_16bit
 
-# TODO
-# handle spacing
-# tool size max bound as function image size
-# handle multiple axis
-#     spacing
-#     xy, z drawing size
-# TODO client side optimization, javascript links instead of python
-#   label dropdown to pointer+path color
-#   tool size to pointer+path size (can access poltting range to adjsut for zoom level?)
-#   position of tool glyph preview to mouse position
+opts.defaults(
+    opts.Rectangles('ROIedit',
+                    fill_color=None,
+                    line_width=2,
+                    line_color='white',
+                    line_dash='dashed'))
 
 
-class LabelEditor(param.Parameterized):
+class RoiEditor(param.Parameterized):
+    '''mixin class to add bounding box editor capabilities'''
+
+    roi_plot = param.Parameter(hv.Rectangles([], group='ROIedit'))
+    box_edit = param.Parameter(streams.BoxEdit(), instantiate=True)
+    spacing = param.NumericTuple((1, 1), doc='2D pixel size')
+
+    def __init__(self, *args, **kwargs):
+        num_objects = kwargs.pop('num_objects', 1)
+        super().__init__(*args, **kwargs)
+
+        self.box_edit.num_objects = num_objects
+        self.box_edit.source = self.roi_plot
+
+    def img_slice(self):
+        '''return image slice in px coordinates'''
+        if self.box_edit.data is None or not self.box_edit.data['x0']:
+            return None
+
+        # repack dict of 4 lists as a list of (x0,x1,y0,y1)
+        rois = list(zip(*self.box_edit.data.values()))
+
+        loc = [(slice(max(0, round(y1 / self.spacing[0])),
+                      max(0, round(y0 / self.spacing[0]))),
+                slice(max(0, round(x0 / self.spacing[1])),
+                      max(0, round(x1 / self.spacing[1]))))
+               for x0, x1, y0, y1 in rois]
+        return loc
+
+
+class EditableHvDataset(HvDataset):
     '''Extract a data array from a holoviews element and makes it editable'''
 
-    array = param.Array(precedence=-1)
-    kdims_val = param.List(precedence=-1)
     locked_mask = param.Array(
         precedence=-1, doc='''mask of region that should not be updated''')
-
     drawing_label = param.Selector(default=1, objects=[-1, 0, 1])
-    img_pipe = param.Parameter(streams.Pipe(), precedence=-1)
     editor_switches = param.ListSelector(
         default=[], objects=['label picker', 'lock bg', 'lock fg'])
 
-    update_inprogress = param.Boolean(False, precedence=-1)
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
 
-    def __call__(self, dmap):
+        self.update_locked_mask()
+        self.update_drawing_label_list()
 
-        dmap = hv.util.Dynamic(dmap,
-                               operation=self._dynamic_call,
-                               streams=[self.img_pipe]).relabel(dmap.label)
-        return dmap
+    def pick_label(self, coords):
+        if len(coords) != self.img.ndim:
+            raise ValueError(
+                'Supplied coordinates: {} does not match the image dimensions: {}'
+                .format(coords, self.img.ndim))
 
-    def _dynamic_call(self, element, data):
-        '''rebuilds image with piped data'''
+        if 'label picker' in self.editor_switches:
+            coords = tuple(int(round(c)) for c in coords)
+            clicked_label = self.img[coords]
+            self.drawing_label = clicked_label
 
-        if data is not None and self.update_inprogress:
-            # element is being updated with newly drawn path
-
-            element = element.clone((*self.kdims_val, data))
-
-        else:
-            # element is being update from outside
-            # reset internal data with new element and let pass through
-            # TODO handle multiple vdims?
-            kdims_name = [d.name for d in element.kdims]
-            self.kdims_val = [
-                element.dimension_values(name, expanded=False)
-                for name in kdims_name
-            ]
-            self.array = element.dimension_values(element.vdims[0].name,
-                                                  flat=False)
-
-        return element
-
-    @param.depends('array', 'editor_switches', watch=True)
+    @param.depends('img', 'editor_switches', watch=True)
     def update_locked_mask(self):
-        mask = np.zeros_like(self.array, dtype=bool)
+        mask = np.zeros_like(self.img, dtype=bool)
 
         if 'lock bg' in self.editor_switches:
-            mask[self.array == 0] = True
+            mask[self.img == 0] = True
 
         if 'lock fg' in self.editor_switches:
-            mask[self.array > 0] = True
+            mask[self.img > 0] = True
 
         self.locked_mask = mask
 
     def write_label(self, mask):
 
-        new_array = self.array
+        new_array = self.img
         new_array[mask & (~self.locked_mask)] = self.drawing_label
 
         # assign new array to trigger updates
-        self.array = new_array
+        self.img = new_array
 
-        self.img_pipe.send(self.array)
-
-    @param.depends('array', watch=True)
+    @param.depends('img', watch=True)
     def update_drawing_label_list(self):
         '''List of label to choose from.'''
 
-        unique_labels = np.unique(self.array)
+        unique_labels = np.unique(self.img)
         # add an extra label to annotate new objects
         unique_labels = np.append(unique_labels, unique_labels.max() + 1)
         unique_labels = list({-1, 0, 1}.union(set(unique_labels)))
         unique_labels.sort()
 
-        # if current label not in new list, set to -1
-        if self.drawing_label not in unique_labels:
-            self.drawing_label = -1
+        drawing_label = self.drawing_label
 
         self.param.drawing_label.objects = unique_labels
 
-    def set_picked_label(self, label):
-        if 'label picker' in self.editor_switches:
-            self.drawing_label = label
+        # if current label not in new list, set to -1
+        if drawing_label not in unique_labels:
+            self.drawing_label = -1
+        else:
+            self.drawing_label = drawing_label
 
     def delete_label(self, event=None):
-        self.array[self.array == self.drawing_label] = -1
-        self.array = self.array
-        self.img_pipe.send(self.array)
+        self.img[self.img == self.drawing_label] = -1
+        self.img = self.img
+
+    @param.depends('img')
+    def _drawing_label_wg(self):
+        return pn.panel(self.param.drawing_label)
 
     def widgets(self):
         delete_button = pn.widgets.Button(name='delete selected label')
         delete_button.on_click(self.delete_label)
 
         return pn.WidgetBox(
-            pn.Param(self.param,
+            self._drawing_label_wg,
+            pn.Param(self.param.editor_switches,
+                     show_name=False,
                      widgets={
                          'editor_switches': {
                              'type': pn.widgets.CheckButtonGroup
@@ -125,110 +138,92 @@ class LabelEditor(param.Parameterized):
 
 
 class FreehandEditor(param.Parameterized):
-    '''Adds a freehand drawing tool that embeds the drawn path in the iamge/stack'''
+    '''Adds a freehand drawing tool that embeds the drawn path in the image/stack'''
 
-    label_editor = param.Parameter(precedence=-1)
+    dataset = param.Parameter(EditableHvDataset(), precedence=-1)
     freehand = param.Parameter(streams.FreehandDraw(num_objects=1),
                                precedence=-1)
-    pointer_pos = param.Parameter(streams.PointerXY(), precedence=-1)
+    pointer_pos = param.Parameter(streams.PointerXY(),
+                                  precedence=-1,
+                                  instantiate=True)
     clicked_pos = param.Parameter(streams.SingleTap(transient=True),
-                                  precedence=-1)
+                                  precedence=-1,
+                                  instantiate=True)
+    pipe = param.Parameter(streams.Pipe(data=[]),
+                           instantiate=True,
+                           precedence=-1)
+    path_plot = param.Parameter(hv.Path([]), precedence=-1)
+
+    cmap = param.Parameter(glasbey_hv_16bit, precedence=-1)
+    zoom_level = param.Number(1.0, precedence=-1)
+    tool_width = param.Integer(20, bounds=(1, 300))
 
     zoom_range = param.Parameter(
         streams.RangeX(),
         doc=
         '''range stream used to adjust glyph size based on zoom level, assumes data_aspect=1''',
         precedence=-1)
+    plot_size = param.Parameter(streams.PlotSize(), precedence=-1)
     zoom_level = param.Number(1.0, precedence=-1)
-    zoomed_initialized = param.Boolean(False, precedence=-1)
+    zoom_initialized = param.Boolean(False, precedence=-1)
 
-    drawingtool = param.Parameter(precedence=-1)
-    slicing_info = param.Callable(
-        doc='''callable return the axis and slice id of the current plot''',
-        precedence=-1)
-    cmap = param.Parameter(label_cmap, precedence=-1)
-
-    tool_width = param.Integer(20, bounds=(1, 300))
-    _plot_width = param.Integer(500, precedence=-1)
-
-    def __init__(self, label_editor, plot_width, *args, **kwargs):
+    def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
-
-        self.label_editor = label_editor
-        self._plot_width = plot_width
 
         # grey glyph for drawing label -1 (unlabeled)
         self.cmap[-1] = '#999999'
 
-        self.reset()
+        self.path_plot = hv.DynamicMap(self.plot_path, streams=[self.pipe])
+        self.freehand.source = self.path_plot
 
-    def reset(self):
-        '''reset drawtool plots'''
+        self.path_plot.opts(opts.Path(active_tools=['freehand_draw']))
+        self.pointer_pos.source = self.path_plot
+        self.clicked_pos.source = self.path_plot
+        self.zoom_range.source = self.path_plot
+        self.plot_size.source = self.path_plot
 
-        self.label_editor.kdims_val = []
-        self.zoomed_initialized = False
+        self.path_plot = self.path_plot * hv.DynamicMap(self.plot_pointer)
 
-        self.pipe = streams.Pipe(data=[])
-        self.drawingtool = hv.DynamicMap(self.plot_path, streams=[self.pipe])
-        self.freehand.source = self.drawingtool
-
-        self.drawingtool.opts(opts.Path(active_tools=['freehand_draw']))
-
-        self.pointer_pos.source = self.drawingtool
-        self.clicked_pos.source = self.drawingtool
-
-        self.drawingtool = self.drawingtool * hv.DynamicMap(self.plot_pointer)
-
-    @param.depends('zoom_range.x_range', watch=True)
+    @param.depends('zoom_range.x_range', 'plot_size.width', watch=True)
     def monitor_zoom_level(self):
-        zrange = self.zoom_range.x_range
+        # TODO handle other than xy axis
 
-        if self.label_editor.kdims_val:
-            image_px_width = len(self.label_editor.kdims_val[0])
-        else:
-            image_px_width = self._plot_width
+        plot_width = self.plot_size.width
+        if plot_width:
+            zrange = self.zoom_range.x_range
 
-        if zrange is None:
-            self.zoom_level = self._plot_width / image_px_width
+            if zrange is None:
+                self.zoom_level = plot_width / self.dataset.img.shape[1]
 
-        else:
-            zoom_width = zrange[1] - zrange[0]
-            # TODO handle other than xy axis
-            full_width = self.label_editor.kdims_val[0].max(
-            ) - self.label_editor.kdims_val[0].min()
-            self.zoom_level = full_width / zoom_width * self._plot_width / image_px_width
+            else:
+                zoomed_width = self.dataset.spacing[1] * (zrange[1] -
+                                                          zrange[0])
+                self.zoom_level = plot_width / zoomed_width
 
-    @param.depends('label_editor.drawing_label', 'tool_width', 'zoom_level')
+    @param.depends('dataset.drawing_label', 'tool_width', 'zoom_level')
     def plot_path(self, data):
+        self.a = self.dataset.drawing_label
         # at this stage is redered and size known
-        if not self.zoomed_initialized:
+        if not self.zoom_initialized:
             self.monitor_zoom_level()
-            self.zoomed_initialized = True
+            self.zoom_initialized = True
 
         path = hv.Path(data)
         path.opts(
             opts.Path(line_width=self.tool_width * self.zoom_level + 1,
-                      color=self.cmap[self.label_editor.drawing_label],
+                      color=self.cmap[self.dataset.drawing_label],
                       line_cap='round',
                       line_join='round'))
 
         return path
 
-    @param.depends('label_editor.drawing_label', 'tool_width', 'zoom_level',
+    @param.depends('dataset.drawing_label', 'tool_width', 'zoom_level',
                    'pointer_pos.x', 'pointer_pos.y')
     def plot_pointer(self):
 
-        if not self.zoomed_initialized:
+        if not self.zoom_initialized:
             self.monitor_zoom_level()
-            self.zoomed_initialized = True
-
-        # limit to image bounds
-        if self.label_editor.kdims_val:
-            x_max = self.label_editor.kdims_val[0].max()
-            y_max = self.label_editor.kdims_val[1].max()
-        else:
-            x_max = 0.
-            y_max = 0.
+            self.zoom_initialized = True
 
         pos_x = self.pointer_pos.x
         if pos_x is None:
@@ -238,86 +233,75 @@ class FreehandEditor(param.Parameterized):
         if pos_y is None:
             pos_y = 0.
 
-        pos_x = max(min(pos_x, x_max), 0)
-        pos_y = max(min(pos_y, y_max), 0)
-
         pt = hv.Points((pos_x, pos_y))
         pt.opts(
             opts.Points(
                 size=self.tool_width * self.zoom_level,
-                color=self.cmap[self.label_editor.drawing_label],
+                color=self.cmap[self.dataset.drawing_label],
                 shared_axes=True,
             ))
 
         return pt
 
-    @param.depends('clicked_pos.x', 'clicked_pos.y', watch=True)
-    def monitor_clicked_label(self):
-        if self.clicked_pos.x is not None and self.clicked_pos.y is not None:
-            # TODO update to handle spacing/3D
-
-            axis, slice_id = self.slicing_info()
-            x = int(round(self.clicked_pos.x))
-            y = int(round(self.clicked_pos.y))
-
-            if self.label_editor.array.ndim > 2:
-                self.label_editor.set_picked_label(
-                    int(self.label_editor.array[slice_id, y, x]))
-            else:
-                self.label_editor.set_picked_label(
-                    int(self.label_editor.array[y, x]))
-
-    def __call__(self, dmap, slicing_info):
-        self.slicing_info = slicing_info
-        self.zoom_range.source = dmap
-
-        return dmap
-
+    @param.depends('freehand.data', watch=True)
     def embedd_path(self):
         '''write the polygon path on rasterized array with correct label and width'''
 
         coords = self.freehand.data
-        xs = np.asarray(np.rint(np.asarray(coords['xs'][0]) - 0.5), dtype=int)
-        ys = np.asarray(np.rint(np.asarray(coords['ys'][0]) - 0.0), dtype=int)
-        pts = np.stack([xs, ys], axis=1).astype(np.int32)
+        if coords and coords['ys']:
+            xs = np.asarray(np.rint(np.asarray(coords['xs'][0]) - 0.5),
+                            dtype=int)
+            ys = np.asarray(np.rint(np.asarray(coords['ys'][0]) - 0.0),
+                            dtype=int)
+            pts = np.stack([xs, ys], axis=1).astype(np.int32)
 
-        mask = np.zeros_like(self.label_editor.array, np.uint8)
-        if mask.ndim > 2:
-            axis, slice_id = self.slicing_info()
-            cv.polylines(
-                mask[slice_id],
-                [pts],
-                False,
-                1,
-                self.tool_width,  # // 2,
-                cv.LINE_8)
-        else:
-            cv.polylines(
-                mask,
-                [pts],
-                False,
-                1,
-                self.tool_width,  # // 2,
-                cv.LINE_8)
+            mask = np.zeros_like(self.dataset.img, np.uint8)
+            if mask.ndim > 2:
+                raise NotImplementedError(
+                    'drawing on 3D stack not implemented')
 
-        mask = mask.astype(bool)
+    #             axis, slice_id = self.slicing_info()
+    #             cv.polylines(
+    #                 mask[slice_id],
+    #                 [pts],
+    #                 False,
+    #                 1,
+    #                 self.tool_width,  # // 2,
+    #                 cv.LINE_8)
+            else:
+                cv.polylines(
+                    mask,
+                    [pts],
+                    False,
+                    1,
+                    self.tool_width,  # // 2,
+                    cv.LINE_8)
 
-        self.label_editor.write_label(mask)
+            mask = mask.astype(bool)
 
-    @param.depends('freehand.data', watch=True)
-    def _update_data(self):
-        coords = self.freehand.data
-
-        if coords and coords['ys'] and not self.label_editor.update_inprogress:
-            self.label_editor.update_inprogress = True
-
-            self.embedd_path()
-
+            self.dataset.write_label(mask)
             self._clear()
-            self.label_editor.update_inprogress = False
+
+    @param.depends('clicked_pos.x', 'clicked_pos.y', watch=True)
+    def monitor_clicked_label(self):
+        if self.clicked_pos.x is not None and self.clicked_pos.y is not None:
+            x = int(round(self.clicked_pos.x))
+            y = int(round(self.clicked_pos.y))
+            coords = (y, x)
+
+            if self.dataset.img.ndim > 2:
+                # TODO implement 3D
+                raise NotImplementedError(
+                    'picking label in 3D stack not implemented')
+                # axis, slice_id = self.slicing_info()
+                # coords = (slice_id,) + coords
+
+            self.dataset.pick_label(coords)
 
     def _clear(self):
         self.pipe.send([])
 
     def widgets(self):
-        return pn.WidgetBox(pn.Param(self.param))
+        wg = self.dataset.widgets()
+        wg.append(self.param.tool_width)
+        return wg

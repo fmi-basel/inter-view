@@ -1,43 +1,46 @@
 import numpy as np
 import pandas as pd
-
+from concurrent.futures import ThreadPoolExecutor
+import gc
+import param
+import panel as pn
 import holoviews as hv
 hv.extension('bokeh', logo=False)
 
-import param
-import panel as pn
-
-from improc.io import LSCAccessor
-LSCAccessor.register()
+from improc.io import DCAccessor
+DCAccessor.register()
 
 
-class DataHandler(param.Parameterized):
-    dc = param.DataFrame()
-    subdc = param.DataFrame()
-    widgets = param.List([])
+class CollectionHandler(param.Parameterized):
+    '''Builds an interactive menu matching the index/multi-index of a dataframe. 
+    The indexed dataframe is available as "subdf" attribute.'''
+
+    df = param.DataFrame()
+    subdf = param.DataFrame()
+    file_widgets = param.List([])
 
     updating_widget = param.Boolean(False)
     update_count = param.Integer(0)
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
-        self._add_widgets()
+        self._build_widgets()
 
     def _get_available_index_level_values(self, level_id):
         if level_id == 0:
-            index = self.dc.index
+            index = self.df.index
             if index.name is None:
                 index.name = 'index'
         else:
             lower_levels_index = tuple(w.value
-                                       for w in self.widgets[:level_id])
-            index = self.dc.lsc[lower_levels_index].index
+                                       for w in self.file_widgets[:level_id])
+            index = self.df.dc[lower_levels_index].index
 
         return index.unique(level=level_id)
 
     def _get_level_widget(self, level_id):
 
-        level = self._get_available_index_level_values(level_id)
+        options = self._get_available_index_level_values(level_id)
 
         # TODO mouseup callback policy
         # value_throttle is not updating, unlike mentioned in the doc, callback_policy is not a valid option
@@ -45,118 +48,126 @@ class DataHandler(param.Parameterized):
         #         if np.issubdtype(level, np.number):
         #             return pn.widgets.DiscreteSlider(name=level.name, value=level[0], options=level.tolist())
         #         else:
-        return pn.widgets.Select(name=level.name,
-                                 value=level[0],
-                                 options=level.tolist())
+        return pn.widgets.Select(name=options.name,
+                                 value=options[0],
+                                 options=options.tolist())
 
     def _add_widget_watcher(self):
-        @pn.depends(*[w.param.value for w in self.widgets], watch=True)
+        @pn.depends(*[w.param.value for w in self.file_widgets], watch=True)
         def _widget_watcher(*args):
 
             if not self.updating_widget:
                 # ignore changes until update is finished
                 self.updating_widget = True
 
-                for level_id, wg in enumerate(self.widgets):
+                for level_id, wg in enumerate(self.file_widgets):
                     wg.options = self._get_available_index_level_values(
                         level_id).tolist()
 
                 self.updating_widget = False
                 self.update_count += 1
 
-                idx = tuple(w.value for w in self.widgets)
+                idx = tuple(w.value for w in self.file_widgets)
                 if len(idx) == 1:
                     idx = idx[0]
 
-                self.subdc = self.dc.lsc[idx]
+                self.subdf = self.df.dc[idx]
 
         _widget_watcher()
 
-    def _add_widgets(self):
-        index = self.dc.index
+    def _build_widgets(self):
+        index = self.df.index
 
         if isinstance(index, pd.MultiIndex):
             for lvl_id in range(len(index[0])):
-                self.widgets.append(self._get_level_widget(lvl_id))
+                self.file_widgets.append(self._get_level_widget(lvl_id))
 
         else:
-            self.widgets.append(self._get_level_widget(0))
+            self.file_widgets.append(self._get_level_widget(0))
 
         self._add_widget_watcher()
 
-    @param.depends('subdc')
-    def view_dc(self):
-        return hv.Table(self.subdc).opts(width=900)
+    @param.depends('subdf')
+    def view_df(self):
+        return hv.Table(self.subdf.reset_index()).opts(width=900)
 
-    @property
-    def widgetbox(self):
-        return pn.WidgetBox(*self.widgets)
+    def widgets(self):
+        return pn.WidgetBox(*self.file_widgets)
 
-    @property
     def panel(self):
-        return pn.Column(self.widgetbox, self.view_dc)
+        return pn.Column(self.widgets, self.view_df)
 
 
-class ImageHandler(DataHandler):
-    ds_dims = param.List(
-        doc=
-        """extra dimensions to be included in hv.dataset. e.g. image channels"""
-    )
-    ds = param.Parameter()
+class MultiCollectionHandler(CollectionHandler):
+    '''Variant of DataHandler that allow multiple selection for certain index levels'''
 
-    #     ds_id = param.Number(0, doc="""Random id assigned every time a new hv.Dataset is loaded""")
+    multi_select_levels = param.List([])
+    _multi_select_levels_ids = param.List()
 
-    load_count = param.Integer(
-        0,
-        doc="""counter incrementing every time a new hv.Dataset is loaded""")
-    spacing_col = param.Parameter(
-        None, doc="""name of column containing image spacing""")
+    def _get_level_widget(self, level_id):
+        if not self._multi_select_levels_ids:
+            names = self.df.index.names
+            self._multi_select_levels_ids = [
+                names.index(l_name) for l_name in self.multi_select_levels
+            ]
 
-    #     spacing = param.Array(np.array([1]))
+        options = self._get_available_index_level_values(level_id)
 
-    def __init__(self, dc, ds_dims=[], *args, **kwargs):
-        if ds_dims:
-            try:
-                dc = dc.reset_index(ds_dims)
-            except Exception as e:
-                pass
+        if level_id in self._multi_select_levels_ids:
+            wg = pn.widgets.MultiSelect(
+                name=options.name,
+                value=options.tolist(),
+                options=options.tolist(),
+                # ~height_policy='fit',
+                size=min(len(options.tolist()), 10))
 
-        super().__init__(dc, *args, ds_dims=ds_dims, **kwargs)
-
-
-#         self.load()(*[w.value for w in self.wg])
-
-    @param.depends()
-    def _image_to_hvds(self, imgs):
-        '''Converts images to a holoview dataset to facilitate
-        plotting with the correct axis bounds/scaling'''
-
-        # TODO test more dimensions (time?)
-
-        if self.spacing_col is None:
-            spacing = 1
         else:
-            spacing = self.subdc.iloc[0][self.spacing_col]
+            wg = pn.widgets.Select(name=options.name,
+                                   value=options[0],
+                                   options=options.tolist())
+        return wg
 
-        img = np.stack(imgs, axis=0).squeeze()
+    def multi_select_index(self):
+        '''returns multi select index level of current sub collection'''
+        return tuple(
+            tuple(self.subdf.index.get_level_values(l))
+            for l in self.multi_select_levels)
 
-        # get image dims and coords from first image in list
-        img_dims = ['x', 'y', 'z'][:imgs[0].ndim]
-        spacing = np.broadcast_to(spacing, imgs[0].ndim)
-        img_coords = [
-            np.arange(d) * s
-            for d, s in zip(imgs[0].shape[::-1], spacing[::-1])
-        ]
 
-        # ds extra dataset coords
-        ds_coords = [self.subdc[d].values.tolist() for d in self.ds_dims]
+class DataLoader(MultiCollectionHandler):
+    '''Extension of MultiCollectionHandler that automatically load files of selected part of the data collection'''
 
-        return hv.Dataset((*(img_coords + ds_coords), img),
-                          kdims=img_dims + self.ds_dims,
-                          vdims=['intensity'])
+    loaded_objects = param.Dict()
+    loading_fun = param.Callable(
+        doc=
+        'callable loading function accepting a path as argument. If None the pandas DC accessor is used'
+    )
+    loading_off = param.Boolean(False)
 
-    @param.depends('subdc', watch=True)
-    def update_ds(self):
-        imgs = self.subdc.lsc.read()
-        self.ds = self._image_to_hvds(imgs)
-        self.load_count += 1
+    @param.depends('subdf', watch=True)
+    def _load_files(self):
+
+        if not self.loading_off:
+            if self.loading_fun is not None:
+                # read files in parallel
+                with ThreadPoolExecutor() as threads:
+                    files = threads.map(self.loading_fun, self.subdf.dc.path)
+            else:
+                files = self.subdf.dc.read()
+
+            # set keys using levels that can have multiple selection
+            if len(self.multi_select_levels) == 0:
+                keys = self.subdf.index
+            elif len(self.multi_select_levels) == 1:
+                keys = self.subdf.index.get_level_values(
+                    self.multi_select_levels[0])
+            else:
+                keys = zip(*[
+                    self.subdf.index.get_level_values(l)
+                    for l in self.multi_select_levels
+                ])
+
+            self.loaded_objects = {k: f for k, f in zip(keys, files)}
+
+            # force garbage collection
+            gc.collect()
