@@ -407,6 +407,7 @@ class OrthoSegmentationDashBoard(BaseImageDashBoard):
     hv_datasets = param.List()
     ortho_viewer = param.Parameter(OrthoViewer(add_crosshairs=False))
     spacing = param.Parameter((1, ), doc='pixel/voxel size', precedence=-1)
+    init_position = param.Array(np.array([-1, -1, -1]))
 
     last_clicked_position = param.Array(np.array([]))
 
@@ -475,7 +476,8 @@ class OrthoSegmentationDashBoard(BaseImageDashBoard):
 
     @param.depends('_complete_update_counter')
     def _rebuild_panel(self):
-        self.ortho_viewer = OrthoViewer(add_crosshairs=False)
+        self.ortho_viewer = OrthoViewer(add_crosshairs=False,
+                                        target_position=self.init_position)
 
         panel = self.ortho_viewer.panel(self.dmap())
 

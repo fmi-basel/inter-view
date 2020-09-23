@@ -286,7 +286,8 @@ class SegmentationViewer(OverlayViewer):
 class SliceViewer(BaseViewer):
     '''Slices hv.Dataset along the specified axis.'''
 
-    slice_id = param.ObjectSelector(default=0, objects=[0])
+    slice_id = param.ObjectSelector(default=0)  #, objects=[0])
+    slice_init = param.Number(-1)
     axis = param.String(default='z')
 
     def __init__(self, *args, **kwargs):
@@ -305,7 +306,10 @@ class SliceViewer(BaseViewer):
     def update_slider_coords(self, element):
         coords = element.dimension_values(self.axis, expanded=False)
         self.param.slice_id.objects = coords
-        self.slice_id = coords[len(coords) // 2]
+        if self.slice_init < 0:
+            self.slice_id = coords[len(coords) // 2]
+        else:
+            self.moveto(self.slice_init)
 
     def _find_nearest_value(self, array, value):
         array = np.asarray(array)
@@ -354,6 +358,9 @@ class OrthoViewer(BaseViewer):
     zy_tap = param.Parameter(LastTap())
     xz_tap = param.Parameter(LastTap())
 
+    target_position = param.Array(np.array([-1, -1, -1]))
+    _updating_position = param.Boolean(False)
+
     add_crosshairs = param.Boolean(True)
 
     @param.depends()
@@ -394,14 +401,12 @@ class OrthoViewer(BaseViewer):
                 (self.xz_v, self.xz_h)]
 
     def _link_crosshairs(self):
-
-        # move crosshair to slider position (that should now be initizaled)
-        self.xy_v.data = self.x_viewer._widget.value
-        self.xy_h.data = self.y_viewer._widget.value
-        self.zy_v.data = self.z_viewer._widget.value
-        self.zy_h.data = self.y_viewer._widget.value
-        self.xz_v.data = self.x_viewer._widget.value
-        self.xz_h.data = self.z_viewer._widget.value
+        self.xy_v.data = self.x_viewer.slice_id
+        self.xy_h.data = self.y_viewer.slice_id
+        self.zy_v.data = self.z_viewer.slice_id
+        self.zy_h.data = self.y_viewer.slice_id
+        self.xz_v.data = self.x_viewer.slice_id
+        self.xz_h.data = self.z_viewer.slice_id
 
         self._jslink_discrete_slider(self.x_viewer._widget, self.xy_v)
         self._jslink_discrete_slider(self.y_viewer._widget, self.xy_h)
@@ -435,25 +440,40 @@ class OrthoViewer(BaseViewer):
 
         self._init_tap_navigator(dmap_xy, dmap_zy, dmap_xz)
 
+        self.z_viewer.slice_init = self.target_position[0]
+        self.y_viewer.slice_init = self.target_position[1]
+        self.x_viewer.slice_init = self.target_position[2]
+
         return (dmap_xy, dmap_zy, dmap_xz)
+
+    @param.depends('target_position', watch=True)
+    def _update_target_position(self):
+        if not self._updating_position:
+            self._updating_position = True
+
+            self.z_viewer.moveto(self.target_position[0])
+            self.y_viewer.moveto(self.target_position[1])
+            self.x_viewer.moveto(self.target_position[2])
+
+            self._updating_position = False
 
     @param.depends('xy_tap.c0', 'xy_tap.c1', watch=True)
     def _update_xy_sliders(self):
         if self.navigaton_on:
-            self.x_viewer.moveto(self.xy_tap.c0)
-            self.y_viewer.moveto(self.xy_tap.c1)
+            self.target_position = np.array(
+                [self.z_viewer.slice_id, self.xy_tap.c1, self.xy_tap.c0])
 
     @param.depends('zy_tap.c0', 'zy_tap.c1', watch=True)
     def _update_zy_sliders(self):
         if self.navigaton_on:
-            self.z_viewer.moveto(self.zy_tap.c0)
-            self.y_viewer.moveto(self.zy_tap.c1)
+            self.target_position = np.array(
+                [self.zy_tap.c0, self.zy_tap.c1, self.x_viewer.slice_id])
 
     @param.depends('xz_tap.c0', 'xz_tap.c1', watch=True)
     def _update_xz_sliders(self):
         if self.navigaton_on:
-            self.x_viewer.moveto(self.xz_tap.c0)
-            self.z_viewer.moveto(self.xz_tap.c1)
+            self.target_position = np.array(
+                [self.xz_tap.c1, self.y_viewer.slice_id, self.xz_tap.c0])
 
     def _init_tap_navigator(self, xy, zy, xz):
         self.xy_tap(xy)
@@ -464,6 +484,7 @@ class OrthoViewer(BaseViewer):
         xy, zy, xz = dmaps
 
         self._update_dynamic_values(xy, zy, xz)
+
         zy.opts(
             opts.Image(frame_width=self.frame_z_size,
                        frame_height=self.frame_y_size),
