@@ -394,6 +394,15 @@ class OrthoViewer(BaseViewer):
                 (self.xz_v, self.xz_h)]
 
     def _link_crosshairs(self):
+
+        # move crosshair to slider position (that should now be initizaled)
+        self.xy_v.data = self.x_viewer._widget.value
+        self.xy_h.data = self.y_viewer._widget.value
+        self.zy_v.data = self.z_viewer._widget.value
+        self.zy_h.data = self.y_viewer._widget.value
+        self.xz_v.data = self.x_viewer._widget.value
+        self.xz_h.data = self.z_viewer._widget.value
+
         self._jslink_discrete_slider(self.x_viewer._widget, self.xy_v)
         self._jslink_discrete_slider(self.y_viewer._widget, self.xy_h)
         self._jslink_discrete_slider(self.z_viewer._widget, self.zy_v)
