@@ -13,7 +13,7 @@ from bokeh.models import HoverTool
 from inter_view.utils import HvDataset  #, label_cmap, split_element, zoom_bounds_hook# rasterize_custom
 from inter_view.view_images import SliceViewer, OverlayViewer, OrthoViewer, CompositeViewer, SegmentationViewer
 from inter_view.edit_images import RoiEditor, EditableHvDataset, FreehandEditor
-from inter_view.io import DataLoader
+from inter_view.io import DataLoader, MultiCollectionHandler
 
 
 class BaseImageDashBoard(DataLoader):
@@ -490,7 +490,7 @@ class OrthoSegmentationDashBoard(BaseImageDashBoard):
         return pn.Row(self._rebuild_panel)
 
 
-class ScatterDashBoard(param.Parameterized):
+class ScatterDashBoard(MultiCollectionHandler, param.Parameterized):
     '''Dashboard to view 3 dimensions (x,y,color) of a multidimensional dataset 
     as a scatter plot.'''
 
@@ -498,42 +498,35 @@ class ScatterDashBoard(param.Parameterized):
     y_key = param.Selector()
     color_key = param.Selector()
     hover_keys = param.List()
-
-    props = param.DataFrame(pd.DataFrame())
+    filter_columns = param.List()
 
     selected_row = param.Series(pd.Series([], dtype=int))
     selection_ids = param.List([])
 
-    def __init__(self,
-                 props,
-                 x_key=None,
-                 y_key=None,
-                 color_key=None,
-                 *args,
-                 **kwargs):
+    def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
 
-        self.props = props
-
-        available_keys = props.columns.tolist()
+        available_keys = self.df.columns.tolist()
         self.param.x_key.objects = available_keys
         self.param.y_key.objects = available_keys
         self.param.color_key.objects = available_keys
 
-        if x_key:
-            self.x_key = x_key
-        else:
+        if not self.x_key:
             self.x_key = available_keys[0]
 
-        if y_key:
-            self.y_key = y_key
-        else:
+        if not self.y_key:
             self.y_key = available_keys[1]
 
-        if color_key:
-            self.color_key = color_key
-        else:
+        if not self.color_key:
             self.color_key = available_keys[2]
+
+        if isinstance(self.df.index, pd.MultiIndex):
+            self.multi_select_levels = list(self.df.index.names)
+        else:
+            self.multi_select_levels = [self.df.index.name]
+
+        self.file_widgets = []
+        self._build_widgets()
 
     def _selected_hook(self, plot, element):
         '''Directly access bokeh figure and set selection'''
@@ -544,16 +537,16 @@ class ScatterDashBoard(param.Parameterized):
 
         plot.handles['selected'].indices = self.selection_ids
 
-    @param.depends('x_key', 'y_key', 'color_key', 'selection_ids')
+    @param.depends('x_key', 'y_key', 'color_key', 'selection_ids', 'subdf')
     def plot_scatter(self):
-        points = hv.Points(self.props,
+        points = hv.Points(self.subdf,
                            kdims=[self.x_key, self.y_key],
                            vdims=self.hover_keys + [self.color_key],
                            group='props_scatter')
 
         # change colormap for categorical values
-        if self.props[self.color_key].dtype == 'O':
-            if len(self.props[self.color_key].unique()) <= 10:
+        if self.subdf[self.color_key].dtype == 'O':
+            if len(self.subdf[self.color_key].unique()) <= 10:
                 cmap = 'Category10'
             else:
                 cmap = 'Category20'
@@ -562,7 +555,7 @@ class ScatterDashBoard(param.Parameterized):
         else:
             cmap = 'viridis'
             colorbar = True
-            color_levels = len(self.props[self.color_key].unique())
+            color_levels = len(self.subdf[self.color_key].unique())
 
         points.opts(
             color=self.color_key,
@@ -578,7 +571,7 @@ class ScatterDashBoard(param.Parameterized):
         @param.depends(self._selection.param.index, watch=True)
         def update_image_selectors(index):
             if len(index) > 0:
-                self.selected_row = self.props.iloc[index[0]]
+                self.selected_row = self.subdf.iloc[index[0]]
 
         points.opts(hooks=[self._selected_hook])
 
@@ -586,12 +579,14 @@ class ScatterDashBoard(param.Parameterized):
         return points  #.hist(dimension=[self.x_key, self.y_key], num_bins=100).opts(opts.Histogram(color='grey', yaxis='bare', xaxis='bare'))
 
     def widget(self):
-        return pn.WidgetBox(
+        scatter_wg = pn.WidgetBox(
             'Scatter',
             self.param.x_key,
             self.param.y_key,
             self.param.color_key,
         )
+
+        return pn.Row(scatter_wg, super().widgets)
 
     def panel(self):
         return pn.Column(self.plot_scatter, self.widget())
