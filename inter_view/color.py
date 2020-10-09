@@ -93,3 +93,6 @@ mesh_cmaps = [
 for cmap in mesh_cmaps:
     if not isinstance(cmap, str):
         cm.register_cmap(name=cmap.name, cmap=cmap)
+
+clipped_plasma_r = plt.get_cmap('clipped_plasma_r')
+clipped_plasma = plt.get_cmap('clipped_plasma')
