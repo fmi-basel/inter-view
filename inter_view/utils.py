@@ -71,8 +71,18 @@ class HvDataset(param.Parameterized):
 
     _update_counter = param.Integer(0, precedence=-1)
 
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._broadcast_spacing()
+
+    @param.depends()
+    def _broadcast_spacing(self):
+        self.spacing = tuple(
+            np.broadcast_to(np.array(self.spacing), self.img.ndim).tolist())
+
     @param.depends('img', watch=True)
     def _update_img(self):
+        self._broadcast_spacing()
         self._update_counter += 1
 
     # NOTE dynamic map with dependency directly on array is less responsive (hash computation overhead?)
