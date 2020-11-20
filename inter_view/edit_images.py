@@ -54,8 +54,10 @@ class EditableHvDataset(HvDataset):
     locked_mask = param.Array(
         precedence=-1, doc='''mask of region that should not be updated''')
     drawing_label = param.Selector(default=1, objects=[-1, 0, 1])
-    editor_switches = param.ListSelector(
-        default=[], objects=['label picker', 'lock bg', 'lock fg'])
+    editor_switches = param.ObjectSelector(
+        default='pick label', objects=['-', 'pick label', 'fill label'])
+    locking_switches = param.ListSelector(default=[],
+                                          objects=['background', 'foreground'])
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
@@ -63,25 +65,29 @@ class EditableHvDataset(HvDataset):
         self.update_locked_mask()
         self.update_drawing_label_list()
 
-    def pick_label(self, coords):
+    def click_callback(self, coords):
         if len(coords) != self.img.ndim:
             raise ValueError(
                 'Supplied coordinates: {} does not match the image dimensions: {}'
                 .format(coords, self.img.ndim))
 
-        if 'label picker' in self.editor_switches:
-            coords = tuple(int(round(c)) for c in coords)
-            clicked_label = self.img[coords]
-            self.drawing_label = clicked_label
+        coords = tuple(int(round(c)) for c in coords)
+        clicked_label = self.img[coords]
 
-    @param.depends('img', 'editor_switches', watch=True)
+        if 'pick label' == self.editor_switches:
+            self.drawing_label = clicked_label
+        elif 'fill label' == self.editor_switches:
+            mask = self.img == clicked_label
+            self.write_label(mask)
+
+    @param.depends('img', 'locking_switches', watch=True)
     def update_locked_mask(self):
         mask = np.zeros_like(self.img, dtype=bool)
 
-        if 'lock bg' in self.editor_switches:
+        if 'background' in self.locking_switches:
             mask[self.img == 0] = True
 
-        if 'lock fg' in self.editor_switches:
+        if 'foreground' in self.locking_switches:
             mask[self.img > 0] = True
 
         self.locked_mask = mask
@@ -126,15 +132,26 @@ class EditableHvDataset(HvDataset):
         delete_button = pn.widgets.Button(name='delete selected label')
         delete_button.on_click(self.delete_label)
 
-        return pn.WidgetBox(
-            self._drawing_label_wg,
-            pn.Param(self.param.editor_switches,
-                     show_name=False,
-                     widgets={
-                         'editor_switches': {
-                             'type': pn.widgets.CheckButtonGroup
-                         }
-                     }), delete_button)
+        editor_switches_wg = pn.Param(
+            self.param.editor_switches,
+            show_name=True,
+            name="on click",
+            widgets={'editor_switches': {
+                'type': pn.widgets.RadioButtonGroup
+            }})
+
+        locking_switches_wg = pn.Param(self.param.locking_switches,
+                                       show_name=True,
+                                       name='lock',
+                                       widgets={
+                                           'locking_switches': {
+                                               'type':
+                                               pn.widgets.CheckButtonGroup
+                                           }
+                                       })
+
+        return pn.WidgetBox(self._drawing_label_wg, editor_switches_wg,
+                            locking_switches_wg, delete_button)
 
 
 class FreehandEditor(param.Parameterized):
@@ -296,7 +313,7 @@ class FreehandEditor(param.Parameterized):
                 # axis, slice_id = self.slicing_info()
                 # coords = (slice_id,) + coords
 
-            self.dataset.pick_label(coords)
+            self.dataset.click_callback(coords)
 
     def _clear(self):
         self.pipe.send([])
