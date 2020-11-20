@@ -39,7 +39,6 @@ MICROSCOPY_CMAPS = [
                                               (0.7, (1, 1, 0, 1)),
                                               (1, (1, 1, 1, 1))],
                                              N=256),
-    'fire',
 ]
 
 for cmap in MICROSCOPY_CMAPS:
