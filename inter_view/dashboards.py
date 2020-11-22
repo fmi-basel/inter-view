@@ -181,15 +181,7 @@ class ExportCallback(param.Parameterized):
                      }}), export_button)
 
 
-class CompositeExportDashBoard(CompositeDashBoard, RoiEditor, ExportCallback):
-    '''Extension of CompositeDashboard with figure export capabilities'''
-    @param.depends('_complete_update_counter')
-    def dmap(self):
-        dmap = super().dmap()
-        self.export_viewers = self.composite_viewer.channel_viewers
-
-        return dmap * self.roi_plot
-
+class RoiExportCallback(ExportCallback, RoiEditor):
     def _get_export_arguments(self):
         out_path, imgs, cmaps, intensity_bounds, labels = super(
         )._get_export_arguments()
@@ -213,6 +205,16 @@ class CompositeExportDashBoard(CompositeDashBoard, RoiEditor, ExportCallback):
             out_path = pre + '_roi_{}_{}_{}_{}'.format(*roi_bounds) + ext
 
         return out_path, imgs, cmaps, intensity_bounds, labels
+
+
+class CompositeExportDashBoard(CompositeDashBoard, RoiExportCallback):
+    '''Extension of CompositeDashboard with figure export capabilities'''
+    @param.depends('_complete_update_counter')
+    def dmap(self):
+        dmap = super().dmap()
+        self.export_viewers = self.composite_viewer.channel_viewers
+
+        return dmap * self.roi_plot
 
     @param.depends('_complete_update_counter')
     def widgets(self):
@@ -243,8 +245,8 @@ class SegmentationDashBoard(BaseImageDashBoard):
         for hv_ds, img in zip(self.hv_datasets, self.loaded_objects.values()):
             hv_ds.img = img
 
-    @param.depends('_complete_update_counter')
-    def dmap(self):
+    def _get_channel_dmaps(self):
+        '''Returns 1 dynamic map per channel (i.e. not overlayed or blended as composite)'''
 
         if not self.segmentation_viewer.channel_viewers or self._has_multiselect_changed:
             selected_channel_config = {
@@ -267,6 +269,11 @@ class SegmentationDashBoard(BaseImageDashBoard):
         if next(iter(self.loaded_objects.values())).ndim > 2:
             dmaps = [self.slicer(dmap) for dmap in dmaps]
 
+        return dmaps
+
+    @param.depends('_complete_update_counter')
+    def dmap(self):
+        channel_dmaps = self._get_channel_dmaps()
         dmap = self.segmentation_viewer(dmaps)
 
         return dmap
@@ -285,6 +292,25 @@ class SegmentationDashBoard(BaseImageDashBoard):
             plot = self.dmap
 
         return pn.Row(plot, self.widgets)
+
+
+class SegmentationExportDashBoard(SegmentationDashBoard, RoiExportCallback):
+    out_folder = param.Foldername('', doc='output folder')
+
+    @param.depends('_complete_update_counter')
+    def dmap(self):
+        dmaps = self._get_channel_dmaps()
+        dmaps.append(self.roi_plot)
+        dmap = self.segmentation_viewer(dmaps)
+
+        self.export_viewers = self.segmentation_viewer.channel_viewers
+
+        return dmap
+
+    @param.depends('_complete_update_counter')
+    def widgets(self):
+        wg = [super().widgets(), self._export_widgets()]
+        return pn.Column(*wg)
 
 
 # TODO
