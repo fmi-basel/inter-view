@@ -104,9 +104,9 @@ class EditableHvDataset(HvDataset):
     def update_drawing_label_list(self):
         '''List of label to choose from.'''
 
-        unique_labels = np.unique(self.img)
+        max_label = self.img.max()
         # add an extra label to annotate new objects
-        unique_labels = np.append(unique_labels, unique_labels.max() + 1)
+        unique_labels = list(range(max_label + 2))
         unique_labels = list({-1, 0, 1}.union(set(unique_labels)))
         unique_labels.sort()
 
@@ -117,8 +117,6 @@ class EditableHvDataset(HvDataset):
         # if current label not in new list, set to -1
         if drawing_label not in unique_labels:
             self.drawing_label = -1
-        else:
-            self.drawing_label = drawing_label
 
     def delete_label(self, event=None):
         self.img[self.img == self.drawing_label] = -1
@@ -286,9 +284,18 @@ class FreehandEditor(param.Parameterized):
     #                 self.tool_width,  # // 2,
     #                 cv.LINE_8)
             else:
+                # draw polyline on minimal size crop
+                margin = self.tool_width // 2 + 1
+                loc = [
+                    slice(max(0, pts[:, ax].min() - margin),
+                          pts[:, ax].max() + margin) for ax in range(2)
+                ]
+                offset = np.array([s.start for s in loc])[None]
+                loc = loc[::-1]
+                submask = mask[loc]
                 cv.polylines(
-                    mask,
-                    [pts],
+                    submask,
+                    [pts - offset],
                     False,
                     1,
                     self.tool_width,  # // 2,
