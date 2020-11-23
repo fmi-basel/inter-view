@@ -133,7 +133,7 @@ class CompositeDashBoard(BaseImageDashBoard):
 class ExportCallback(param.Parameterized):
     '''Mixin class adding channel export callbacks'''
 
-    out_folder = param.Foldername('', doc='output folder')
+    out_folder = param.String('', doc='output folder')
     export_funs = param.List(
         doc=
         'list of callables with signature (path, imgs, cmaps, intensity_bounds, labels)'
@@ -295,8 +295,6 @@ class SegmentationDashBoard(BaseImageDashBoard):
 
 
 class SegmentationExportDashBoard(SegmentationDashBoard, RoiExportCallback):
-    out_folder = param.Foldername('', doc='output folder')
-
     @param.depends('_complete_update_counter')
     def dmap(self):
         dmaps = self._get_channel_dmaps()
