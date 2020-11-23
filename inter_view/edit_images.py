@@ -106,16 +106,11 @@ class EditableHvDataset(HvDataset):
 
         max_label = self.img.max()
         # add an extra label to annotate new objects
-        unique_labels = list(range(max_label + 2))
-        unique_labels = list({-1, 0, 1}.union(set(unique_labels)))
-        unique_labels.sort()
-
-        drawing_label = self.drawing_label
+        unique_labels = list(range(-1, max_label + 2))
 
         self.param.drawing_label.objects = unique_labels
 
-        # if current label not in new list, set to -1
-        if drawing_label not in unique_labels:
+        if self.drawing_label not in unique_labels:
             self.drawing_label = -1
 
     def delete_label(self, event=None):
