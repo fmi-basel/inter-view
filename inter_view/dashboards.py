@@ -273,7 +273,7 @@ class SegmentationDashBoard(BaseImageDashBoard):
 
     @param.depends('_complete_update_counter')
     def dmap(self):
-        channel_dmaps = self._get_channel_dmaps()
+        dmaps = self._get_channel_dmaps()
         dmap = self.segmentation_viewer(dmaps)
 
         return dmap
