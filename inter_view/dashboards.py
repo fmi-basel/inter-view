@@ -130,6 +130,36 @@ class CompositeDashBoard(BaseImageDashBoard):
         return pn.Row(plot, self.widgets)
 
 
+class DashBoardCallback(param.Parameterized):
+    '''Mixin class adding general callbacks'''
+
+    out_folder = param.String('', doc='output folder')
+    export_funs = param.List(
+        doc=
+        'list of callables accepting a handle of the current Dashboard as single argument'
+    )
+    export_fun = param.ObjectSelector(doc='active export function')
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        if not self.export_funs:
+            raise ValueError('At least one export function is required')
+        self.param.export_fun.objects = self.export_funs
+        self.export_fun = self.export_funs[0]
+
+    def _export_callback(self, event):
+        self.export_fun(self)
+
+    def _export_widgets(self):
+        export_button = pn.widgets.Button(name='export')
+        export_button.on_click(self._export_callback)
+        return pn.WidgetBox(
+            pn.Param(self.param.export_fun,
+                     widgets={'export_fun': {
+                         'name': ''
+                     }}), export_button)
+
+
 class ExportCallback(param.Parameterized):
     '''Mixin class adding channel export callbacks'''
 
