@@ -306,6 +306,10 @@ class SliceViewer(BaseViewer):
     def update_slider_coords(self, element):
         coords = element.dimension_values(self.axis, expanded=False)
         self.param.slice_id.objects = coords
+
+        # the coord range is now initialized --> set flag to
+        # prevent callback chain when moving slider (other channels might need to be resliced)
+        self.initialized = True
         if self.slice_init < 0:
             self.slice_id = coords[len(coords) // 2]
         else:
@@ -326,7 +330,6 @@ class SliceViewer(BaseViewer):
     def _slice_volume(self, element):
         if not self.initialized:
             self.update_slider_coords(element)
-            self.initialized = True
 
         new_dims_name = [d.name for d in element.kdims if d.name != self.axis]
         return element.select(**{
