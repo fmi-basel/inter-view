@@ -360,7 +360,8 @@ class AnnotationDashBoard(SegmentationDashBoard):
             annot_dataset = EditableHvDataset(img=img,
                                               label=self.index_to_str(key))
             # force reset drawing tool axis
-            self.freehand_editor = FreehandEditor(dataset=annot_dataset)
+            self.freehand_editor = FreehandEditor(dataset=annot_dataset,
+                                                  slicer=self.slicer)
             return annot_dataset
         else:
             return HvDataset(img=img, label=self.index_to_str(key))

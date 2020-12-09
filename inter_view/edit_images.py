@@ -177,6 +177,8 @@ class FreehandEditor(param.Parameterized):
     zoom_level = param.Number(1.0, precedence=-1)
     zoom_initialized = param.Boolean(False, precedence=-1)
 
+    slicer = param.Parameter(None)
+
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
 
@@ -253,6 +255,10 @@ class FreehandEditor(param.Parameterized):
 
         return pt
 
+    @staticmethod
+    def _get_axis_id(axis_name):
+        return {'z': 0, 'y': 1, 'x': 2}[axis_name]
+
     @param.depends('freehand.data', watch=True)
     def embedd_path(self):
         '''write the polygon path on rasterized array with correct label and width'''
@@ -267,17 +273,17 @@ class FreehandEditor(param.Parameterized):
 
             mask = np.zeros_like(self.dataset.img, np.uint8)
             if mask.ndim > 2:
-                raise NotImplementedError(
-                    'drawing on 3D stack not implemented')
+                axis = self._get_axis_id(self.slicer.axis)
+                loc = [slice(None) for _ in range(mask.ndim)]
+                loc[axis] = self.slicer.slice_id
 
-    #             axis, slice_id = self.slicing_info()
-    #             cv.polylines(
-    #                 mask[slice_id],
-    #                 [pts],
-    #                 False,
-    #                 1,
-    #                 self.tool_width,  # // 2,
-    #                 cv.LINE_8)
+                cv.polylines(
+                    mask[loc],
+                    [pts],
+                    False,
+                    1,
+                    self.tool_width,  # // 2,
+                    cv.LINE_8)
             else:
                 # draw polyline on minimal size crop
                 margin = self.tool_width // 2 + 1
@@ -309,11 +315,9 @@ class FreehandEditor(param.Parameterized):
             coords = (y, x)
 
             if self.dataset.img.ndim > 2:
-                # TODO implement 3D
-                raise NotImplementedError(
-                    'picking label in 3D stack not implemented')
-                # axis, slice_id = self.slicing_info()
-                # coords = (slice_id,) + coords
+                axis = self._get_axis_id(self.slicer.axis)
+                coords = np.insert(np.array(coords), axis,
+                                   self.slicer.slice_id)
 
             self.dataset.click_callback(coords)
 
