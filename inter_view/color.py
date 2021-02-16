@@ -2,6 +2,8 @@ import matplotlib.colors as colors
 import matplotlib.pyplot as plt
 from matplotlib import cm
 import colorcet as cc
+import numpy as np
+import holoviews as hv
 
 MICROSCOPY_CMAPS = [
     'gray',
@@ -95,3 +97,68 @@ for cmap in mesh_cmaps:
 
 clipped_plasma_r = plt.get_cmap('clipped_plasma_r')
 clipped_plasma = plt.get_cmap('clipped_plasma')
+
+
+def plot_colorbar(cmap,
+                  bounds,
+                  label=None,
+                  orientation='vertical',
+                  backend='matplotlib'):
+    if label is None:
+        label = ''
+
+    cbar_img = np.linspace(0, 1, 256)
+    vmin, vmax = bounds
+
+    opts_kwargs = {
+        'cmap': cmap,
+        'show_frame': False,
+        'framewise': True,
+        'axiswise': True
+    }
+
+    if orientation == 'vertical':
+        cbar_img = cbar_img[:, None]
+        bounds = (0, vmin, 1, vmax)
+
+        opts_kwargs['xaxis'] = None
+        opts_kwargs['yaxis'] = 'right'
+        opts_kwargs['ylabel'] = ''
+        opts_kwargs['yticks'] = 5
+
+    elif orientation == 'horizontal':
+        cbar_img = cbar_img[None]
+        bounds = (vmin, 0, vmax, 1)
+
+        opts_kwargs['xaxis'] = 'bottom'
+        opts_kwargs['yaxis'] = None
+        opts_kwargs['xlabel'] = ''
+        opts_kwargs['xticks'] = 5
+
+    else:
+        raise ValueError(
+            'orientation not recognized. expects vertical|horizontal, got {}'.
+            format(orientation))
+
+    if backend == 'matplotlib':
+        opts_kwargs['sublabel_size'] = 0
+        opts_kwargs['fontsize'] = {'title': 14}
+        if orientation == 'vertical':
+            opts_kwargs['aspect'] = 0.02
+        else:
+            opts_kwargs['aspect'] = 1 / 0.02
+
+    elif backend == 'bokeh':
+        opts_kwargs['fontsize'] = {'title': 8}
+        opts_kwargs['toolbar'] = None
+        if orientation == 'vertical':
+            opts_kwargs['frame_width'] = 15
+        else:
+            opts_kwargs['frame_height'] = 15
+
+    else:
+        raise ValueError(
+            'backend not supported. expects matplotlib|bokeh, got {}'.format(
+                backend))
+
+    return hv.Image(cbar_img, label=label, bounds=bounds).opts(**opts_kwargs)
