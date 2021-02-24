@@ -204,7 +204,10 @@ class FreehandEditor(param.Parameterized):
         if plot_width:
             zrange = self.zoom_range.x_range
 
-            if zrange is None:
+            if np.isnan(zrange[0]) or np.isnan(zrange[1]):
+                return
+
+            elif zrange is None:
                 self.zoom_level = plot_width / self.dataset.img.shape[1]
 
             else:
