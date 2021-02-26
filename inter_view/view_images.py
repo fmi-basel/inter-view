@@ -309,7 +309,7 @@ class SliceViewer(BaseViewer):
 
         # the coord range is now initialized --> set flag to
         # prevent callback chain when moving slider (other channels might need to be resliced)
-        self.initialized = True
+        self.slicer_initialized = True
         if self.slice_init < 0:
             self.slice_id = coords[len(coords) // 2]
         else:
@@ -328,7 +328,7 @@ class SliceViewer(BaseViewer):
 
     @param.depends('slice_id', 'axis')
     def _slice_volume(self, element):
-        if not self.initialized:
+        if not self.slicer_initialized:
             self.update_slider_coords(element)
 
         new_dims_name = [d.name for d in element.kdims if d.name != self.axis]
@@ -339,7 +339,7 @@ class SliceViewer(BaseViewer):
     def _call(self, dmap):
         # reset slider range on first dynamic slice call
         # slider values will corresponds to the last call (intendend for overlay, all dataset should have the same shape)
-        self.initialized = False
+        self.slicer_initialized = False
         return dmap.apply(self._slice_volume)
 
     def widgets(self):
