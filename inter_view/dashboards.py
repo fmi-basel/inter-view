@@ -117,9 +117,7 @@ class CompositeDashBoard(BaseImageDashBoard):
     @param.depends('_widget_update_counter')
     def widgets(self):
 
-        wg = [super().widgets(), self.composite_viewer.widgets]
-        wg = list(filter(None, wg))
-        return pn.Column(*wg)
+        return pn.Column(self.get_file_widgets, self.composite_viewer.widgets)
 
     def panel(self):
         if list(self.loaded_objects.values())[0].ndim > 2:
@@ -311,9 +309,8 @@ class SegmentationDashBoard(BaseImageDashBoard):
     @param.depends('_widget_update_counter')
     def widgets(self):
 
-        wg = [super().widgets(), self.segmentation_viewer.widgets]
-        wg = list(filter(None, wg))
-        return pn.Column(*wg)
+        return pn.Column(self.get_file_widgets,
+                         self.segmentation_viewer.widgets)
 
     def panel(self):
         if list(self.loaded_objects.values())[0].ndim > 2:
@@ -525,9 +522,8 @@ class OrthoSegmentationDashBoard(BaseImageDashBoard):
     @param.depends('_widget_update_counter')
     def widgets(self):
 
-        wg = [super().widgets(), self.segmentation_viewer.widgets]
-        wg = list(filter(None, wg))
-        return pn.Column(*wg)
+        return pn.Column(self.get_file_widgets,
+                         self.segmentation_viewer.widgets)
 
     @param.depends('_complete_update_counter')
     def _rebuild_panel(self):
@@ -641,7 +637,86 @@ class ScatterDashBoard(MultiCollectionHandler, param.Parameterized):
             self.param.color_key,
         )
 
-        return pn.Row(scatter_wg, super().widgets)
+        return pn.Column(scatter_wg, scatter_wg)
 
     def panel(self):
         return pn.Column(self.plot_scatter, self.widget())
+
+
+class LinkedScatterImageDashBoard(param.Parameterized):
+    '''links a scatter dashboard to an image dashboard directionally
+    
+    features and data collection dataframes must have common columns for 
+    indexing (e.g. paltedir, plate_row, plate_columns, etc.)
+    '''
+
+    seg_db = param.Parameter(None)
+    scat_db = param.Parameter(None)
+
+    _updating = param.Boolean(False)
+
+    def __init__(self, *args, **kwargs):
+
+        if kwargs.get('seg_db', None) is None:
+            raise ValueError(
+                'seg_db is None, a segmentation dashboard object must be passed to the constructor'
+            )
+
+        if kwargs.get('scat_db', None) is None:
+            raise ValueError(
+                'scat_db is None, a scatter dashboard object must be passed to the constructor'
+            )
+
+        super().__init__(*args, **kwargs)
+
+    @param.depends('scat_db.selected_row', watch=True)
+    def _load_selection_image(self):
+        '''load image corresponding to first point in selection'''
+        if not self._updating:
+            self._updating = True
+            self.seg_db.loading_off = True
+            for wg in self.seg_db.file_widgets:
+                if not isinstance(wg, pn.widgets.Select):
+                    continue
+
+                if wg.name not in self.scat_db.selected_row.index:
+                    raise KeyError(
+                        'Features dataframe does not contain the "{}" column needed to sync the image viewer'
+                        .format(wg.name))
+
+                print('wg old/new: ', wg.value,
+                      self.scat_db.selected_row[wg.name])
+                wg.value = self.scat_db.selected_row[wg.name]
+
+            self.seg_db.loading_off = False
+
+            # trigger update once all values have been set
+            self.seg_db.param.trigger('subdf')
+            self._updating = False
+
+    @param.depends('seg_db.subdf', watch=True)
+    def _select_image_pt(self):
+        '''select scatter point corresponding to opened image'''
+
+        if not self._updating:
+            self._updating = True
+
+            img_idx_names = [
+                n for n in self.seg_db.subdf.index.names
+                if n not in self.seg_db.multi_select_levels
+            ]
+            img_idx_vals = self.seg_db.subdf.reset_index().loc[
+                0, img_idx_names].tolist()
+            selection_mask = (
+                self.scat_db.subdf[img_idx_names] == img_idx_vals).all(
+                    axis=1).values
+            idx = np.argwhere(selection_mask)
+            if len(idx) > 0:
+                self.scat_db.selection_ids = list(idx[0])
+            else:
+                self.scat_db.selection_ids = []
+
+            self._updating = False
+
+    def panel(self):
+        return pn.Row(self.scat_db.panel(), self.seg_db.panel()).servable()

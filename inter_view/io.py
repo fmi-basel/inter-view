@@ -91,8 +91,14 @@ class CollectionHandler(param.Parameterized):
     def view_df(self):
         return hv.Table(self.subdf.reset_index()).opts(width=900)
 
+    def get_file_widgets(self):
+        if len(self.file_widgets) > 0:
+            return pn.WidgetBox(*self.file_widgets)
+        else:
+            return pn.Row(None)
+
     def widgets(self):
-        return pn.WidgetBox(*self.file_widgets)
+        return self.get_file_widgets
 
     def panel(self):
         return pn.Column(self.widgets, self.view_df)
