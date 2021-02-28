@@ -637,7 +637,7 @@ class ScatterDashBoard(MultiCollectionHandler, param.Parameterized):
             self.param.color_key,
         )
 
-        return pn.Column(scatter_wg, scatter_wg)
+        return pn.Row(scatter_wg, self.get_file_widgets)
 
     def panel(self):
         return pn.Column(self.plot_scatter, self.widget())
