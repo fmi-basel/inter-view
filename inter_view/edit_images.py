@@ -93,8 +93,7 @@ class EditableHvDataset(HvDataset):
         self.locked_mask = mask
 
     def write_label(self, mask):
-
-        new_array = self.img
+        new_array = self.img.astype(np.int16)
         new_array[mask & (~self.locked_mask)] = self.drawing_label
 
         # assign new array to trigger updates

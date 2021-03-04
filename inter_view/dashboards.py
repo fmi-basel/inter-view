@@ -117,7 +117,7 @@ class CompositeDashBoard(BaseImageDashBoard):
     @param.depends('_widget_update_counter')
     def widgets(self):
 
-        return pn.Column(self.get_file_widgets, self.composite_viewer.widgets)
+        return pn.Column(self.io_widgets, self.composite_viewer.widgets)
 
     def panel(self):
         if list(self.loaded_objects.values())[0].ndim > 2:
@@ -309,8 +309,7 @@ class SegmentationDashBoard(BaseImageDashBoard):
     @param.depends('_widget_update_counter')
     def widgets(self):
 
-        return pn.Column(self.get_file_widgets,
-                         self.segmentation_viewer.widgets)
+        return pn.Column(self.io_widgets, self.segmentation_viewer.widgets)
 
     def panel(self):
         if list(self.loaded_objects.values())[0].ndim > 2:
@@ -522,8 +521,7 @@ class OrthoSegmentationDashBoard(BaseImageDashBoard):
     @param.depends('_widget_update_counter')
     def widgets(self):
 
-        return pn.Column(self.get_file_widgets,
-                         self.segmentation_viewer.widgets)
+        return pn.Column(self.io_widgets, self.segmentation_viewer.widgets)
 
     @param.depends('_complete_update_counter')
     def _rebuild_panel(self):
@@ -637,7 +635,7 @@ class ScatterDashBoard(MultiCollectionHandler, param.Parameterized):
             self.param.color_key,
         )
 
-        return pn.Row(scatter_wg, self.get_file_widgets)
+        return pn.Row(scatter_wg, self.io_widgets)
 
     def panel(self):
         return pn.Column(self.plot_scatter, self.widget())

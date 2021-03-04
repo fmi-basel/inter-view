@@ -91,17 +91,18 @@ class CollectionHandler(param.Parameterized):
     def view_df(self):
         return hv.Table(self.subdf.reset_index()).opts(width=900)
 
-    def get_file_widgets(self):
+    @param.depends('update_count')
+    def io_widgets(self):
         if len(self.file_widgets) > 0:
             return pn.WidgetBox(*self.file_widgets)
         else:
             return pn.Row(None)
 
     def widgets(self):
-        return self.get_file_widgets
+        return self.io_widgets()
 
     def panel(self):
-        return pn.Column(self.widgets, self.view_df)
+        return pn.Column(self.io_widgets, self.view_df)
 
 
 class MultiCollectionHandler(CollectionHandler):
