@@ -410,7 +410,7 @@ class AnnotationDashBoard(SegmentationDashBoard):
                 set(self.multi_select_levels))
             row = self.old_subdf.reset_index(single_index).dc[
                 self.annot_channel]
-            row.dc.write(npimg, compress=9)
+            row.dc.write(npimg, compress=9, overwrite=True)
 
     def discard_changes(self, event=None):
 
@@ -627,7 +627,7 @@ class OrthoAnnotationDashBoard(OrthoSegmentationDashBoard):
                 set(self.multi_select_levels))
             row = self.old_subdf.reset_index(single_index).dc[
                 self.annot_channel]
-            row.dc.write(npimg, compress=9)
+            row.dc.write(npimg, compress=9, overwrite=True)
 
     def discard_changes(self, event=None):
 
