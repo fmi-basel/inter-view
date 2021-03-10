@@ -9,7 +9,7 @@ from holoviews import opts
 from holoviews.operation.datashader import rasterize
 
 from inter_view.color import available_cmaps
-from inter_view.utils import LastTap, blend_overlay
+from inter_view.utils import blend_overlay
 
 # defines default options for all viewers
 opts.defaults(
@@ -357,9 +357,12 @@ class OrthoViewer(BaseViewer):
     x_viewer = param.Parameter(SliceViewer(axis='x'))
     y_viewer = param.Parameter(SliceViewer(axis='y'))
 
-    xy_tap = param.Parameter(LastTap())
-    zy_tap = param.Parameter(LastTap())
-    xz_tap = param.Parameter(LastTap())
+    xy_tap = param.Parameter(hv.streams.SingleTap(transient=True),
+                             instantiate=True)
+    zy_tap = param.Parameter(hv.streams.SingleTap(transient=True),
+                             instantiate=True)
+    xz_tap = param.Parameter(hv.streams.SingleTap(transient=True),
+                             instantiate=True)
 
     target_position = param.Array(np.array([-1, -1, -1]))
     _updating_position = param.Boolean(False)
@@ -460,28 +463,28 @@ class OrthoViewer(BaseViewer):
 
             self._updating_position = False
 
-    @param.depends('xy_tap.c0', 'xy_tap.c1', watch=True)
+    @param.depends('xy_tap.x', 'xy_tap.y', watch=True)
     def _update_xy_sliders(self):
-        if self.navigaton_on:
+        if self.navigaton_on and self.xy_tap.x is not None and self.xy_tap.y is not None:
             self.target_position = np.array(
-                [self.z_viewer.slice_id, self.xy_tap.c1, self.xy_tap.c0])
+                [self.z_viewer.slice_id, self.xy_tap.y, self.xy_tap.x])
 
-    @param.depends('zy_tap.c0', 'zy_tap.c1', watch=True)
+    @param.depends('zy_tap.x', 'zy_tap.y', watch=True)
     def _update_zy_sliders(self):
-        if self.navigaton_on:
+        if self.navigaton_on and self.zy_tap.x is not None and self.zy_tap.y is not None:
             self.target_position = np.array(
-                [self.zy_tap.c0, self.zy_tap.c1, self.x_viewer.slice_id])
+                [self.zy_tap.x, self.zy_tap.y, self.x_viewer.slice_id])
 
-    @param.depends('xz_tap.c0', 'xz_tap.c1', watch=True)
+    @param.depends('xz_tap.x', 'xz_tap.y', watch=True)
     def _update_xz_sliders(self):
-        if self.navigaton_on:
+        if self.navigaton_on and self.xz_tap.x is not None and self.xz_tap.y is not None:
             self.target_position = np.array(
-                [self.xz_tap.c1, self.y_viewer.slice_id, self.xz_tap.c0])
+                [self.xz_tap.y, self.y_viewer.slice_id, self.xz_tap.x])
 
     def _init_tap_navigator(self, xy, zy, xz):
-        self.xy_tap(xy)
-        self.zy_tap(zy)
-        self.xz_tap(xz)
+        self.xy_tap.source = xy
+        self.zy_tap.source = zy
+        self.xz_tap.source = xz
 
     def panel(self, dmaps):
         xy, zy, xz = dmaps

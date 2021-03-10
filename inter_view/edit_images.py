@@ -5,6 +5,7 @@ import panel as pn
 import holoviews as hv
 
 from holoviews import streams, opts
+from scipy.ndimage.morphology import distance_transform_edt
 
 from inter_view.utils import label_cmap
 from inter_view.utils import HvDataset
@@ -151,7 +152,8 @@ class FreehandEditor(param.Parameterized):
 
     dataset = param.Parameter(EditableHvDataset(), precedence=-1)
     freehand = param.Parameter(streams.FreehandDraw(num_objects=1),
-                               precedence=-1)
+                               precedence=-1,
+                               instantiate=True)
     pointer_pos = param.Parameter(streams.PointerXY(),
                                   precedence=-1,
                                   instantiate=True)
@@ -171,10 +173,14 @@ class FreehandEditor(param.Parameterized):
         streams.RangeX(),
         doc=
         '''range stream used to adjust glyph size based on zoom level, assumes data_aspect=1''',
-        precedence=-1)
+        precedence=-1,
+        instantiate=True)
     plot_size = param.Parameter(streams.PlotSize(), precedence=-1)
     zoom_level = param.Number(1.0, precedence=-1)
     zoom_initialized = param.Boolean(False, precedence=-1)
+
+    swap_axes = param.Boolean(False)
+    draw_in_3D = param.Boolean(False)
 
     slicer = param.Parameter(None)
 
@@ -195,29 +201,26 @@ class FreehandEditor(param.Parameterized):
 
         self.path_plot = self.path_plot * hv.DynamicMap(self.plot_pointer)
 
+
+#         self.path_plot = hv.DynamicMap(self.plot_pointer)
+
     @param.depends('zoom_range.x_range', 'plot_size.width', watch=True)
     def monitor_zoom_level(self):
-        # TODO handle other than xy axis
-
         plot_width = self.plot_size.width
         if plot_width:
             zrange = self.zoom_range.x_range
 
-            if np.isnan(zrange[0]) or np.isnan(zrange[1]):
-                return
-
-            elif zrange is None:
+            if zrange is None or np.isnan(zrange[0]) or np.isnan(zrange[1]):
                 self.zoom_level = plot_width / self.dataset.img.shape[1]
 
             else:
-                zoomed_width = self.dataset.spacing[1] * (zrange[1] -
-                                                          zrange[0])
-                self.zoom_level = plot_width / zoomed_width
+                zoomed_width = zrange[1] - zrange[0]
+                self.zoom_level = min(
+                    self.dataset.spacing) * plot_width / zoomed_width
 
     @param.depends('dataset.drawing_label', 'tool_width', 'zoom_level')
     def plot_path(self, data):
-        self.a = self.dataset.drawing_label
-        # at this stage is redered and size known
+        # at this stage, plot is rendered and size known
         if not self.zoom_initialized:
             self.monitor_zoom_level()
             self.zoom_initialized = True
@@ -261,31 +264,73 @@ class FreehandEditor(param.Parameterized):
     def _get_axis_id(axis_name):
         return {'z': 0, 'y': 1, 'x': 2}[axis_name]
 
+    @staticmethod
+    def _get_plane_axes_id(axis_name):
+        return {'z': [1, 2], 'y': [0, 2], 'x': [0, 1]}[axis_name]
+
+    def _phy_to_px(self, coords, return_spacing=False):
+        '''Converts physical coords to pxiel coordinates'''
+
+        if self.swap_axes:
+            coords = coords[:, ::-1]
+
+        spacing = np.asarray(self.dataset.spacing)
+        if self.dataset.img.ndim > 2:
+            plane_axes = self._get_plane_axes_id(self.slicer.axis)
+            spacing = spacing[plane_axes]
+
+        coords = coords / spacing[::-1][None]
+
+        px_coords = np.rint(coords).astype(np.int32)
+        if return_spacing:
+            return px_coords, spacing
+        else:
+            return px_coords
+
     @param.depends('freehand.data', watch=True)
     def embedd_path(self):
         '''write the polygon path on rasterized array with correct label and width'''
 
         coords = self.freehand.data
         if coords and coords['ys']:
-            xs = np.asarray(np.rint(np.asarray(coords['xs'][0]) - 0.5),
-                            dtype=int)
-            ys = np.asarray(np.rint(np.asarray(coords['ys'][0]) - 0.0),
-                            dtype=int)
-            pts = np.stack([xs, ys], axis=1).astype(np.int32)
+            pts = np.stack(
+                [np.asarray(coords['xs'][0]),
+                 np.asarray(coords['ys'][0])],
+                axis=1)
 
+            pts, spacing = self._phy_to_px(pts, return_spacing=True)
             mask = np.zeros_like(self.dataset.img, np.uint8)
             if mask.ndim > 2:
                 axis = self._get_axis_id(self.slicer.axis)
                 loc = [slice(None) for _ in range(mask.ndim)]
-                loc[axis] = self.slicer.slice_id
+                loc[axis] = int(self.slicer.slice_id /
+                                self.dataset.spacing[axis])
+                submask = np.zeros(mask[loc].shape, dtype=np.uint8)
 
+                # handle anisotrpic slice --> draw 1 px line and expand with distance transform
                 cv.polylines(
-                    mask[loc],
+                    submask,
                     [pts],
                     False,
                     1,
-                    self.tool_width,  # // 2,
+                    1,  # // 2,
                     cv.LINE_8)
+
+                min_spacing = min(spacing)
+                if self.draw_in_3D:
+                    mask[loc] = submask
+                    dist = distance_transform_edt(
+                        ~mask.astype(bool),
+                        sampling=self.dataset.spacing / min_spacing)
+                    mask = dist <= self.tool_width / 2
+
+                else:
+                    dist = distance_transform_edt(
+                        ~submask.astype(bool),
+                        sampling=(spacing[0] / min_spacing,
+                                  spacing[1] / min_spacing))
+                    mask[loc] = dist <= self.tool_width / 2
+
             else:
                 # draw polyline on minimal size crop
                 margin = self.tool_width // 2 + 1
@@ -312,14 +357,15 @@ class FreehandEditor(param.Parameterized):
     @param.depends('clicked_pos.x', 'clicked_pos.y', watch=True)
     def monitor_clicked_label(self):
         if self.clicked_pos.x is not None and self.clicked_pos.y is not None:
-            x = int(round(self.clicked_pos.x))
-            y = int(round(self.clicked_pos.y))
-            coords = (y, x)
+            coords = self._phy_to_px(
+                np.asarray([[self.clicked_pos.x, self.clicked_pos.y]]))
+            coords = coords[0, ::-1]
 
             if self.dataset.img.ndim > 2:
                 axis = self._get_axis_id(self.slicer.axis)
-                coords = np.insert(np.array(coords), axis,
-                                   self.slicer.slice_id)
+                slice_id = int(self.slicer.slice_id /
+                               self.dataset.spacing[axis])
+                coords = np.insert(coords, axis, slice_id)
 
             self.dataset.click_callback(coords)
 

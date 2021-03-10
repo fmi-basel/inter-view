@@ -145,30 +145,6 @@ def blend_overlay(elems):
     return hv.RGB(rgb, bounds=bounds, group='composite').opts(**options)
 
 
-class LastTap(param.Parameterized):
-    '''Monitors the last clicked position on holoviews plot'''
-
-    c0 = param.Number(-1)
-    c1 = param.Number(-1)
-    tap = param.Parameter(hv.streams.SingleTap(transient=True),
-                          instantiate=True)
-
-    def __init__(self, hvplot=None, *args, **kwargs):
-        super().__init__(*args, **kwargs)
-
-        if hvplot:
-            self.tap.source = hvplot
-
-    def __call__(self, hvplot):
-        self.tap.source = hvplot
-
-    @param.depends('tap.x', 'tap.y', watch=True)
-    def _monitor_tap(self):
-        if self.tap.x is not None and self.tap.y is not None:
-            self.c0 = self.tap.x
-            self.c1 = self.tap.y
-
-
 def split_element(element, axis, values=None):
     '''Applies element.select to all values along axis and returns the result as a list.
     

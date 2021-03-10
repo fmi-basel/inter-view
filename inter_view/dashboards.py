@@ -338,11 +338,7 @@ class SegmentationExportDashBoard(SegmentationDashBoard, RoiExportCallback):
 
 
 # TODO
-# - test on images of the same size
-# - test with spacing != 1
-# - fix + test 3D img
 # - 3D drawing thickness
-# - demo/test notebook
 
 
 class AnnotationDashBoard(SegmentationDashBoard):
@@ -446,7 +442,7 @@ class AnnotationDashBoard(SegmentationDashBoard):
 
 
 class OrthoSegmentationDashBoard(BaseImageDashBoard):
-    '''Dashboard to views 2D, multi-channel images as color composite.'''
+    '''Dashboard to views 3D, multi-channel images as color composite.'''
 
     channel_config = param.Dict({}, doc='dictionnary configuring each channel')
     composite_channels = param.List(
@@ -463,9 +459,6 @@ class OrthoSegmentationDashBoard(BaseImageDashBoard):
     last_clicked_position = param.Array(np.array([]))
 
     _widget_update_counter = param.Integer(0)
-
-    def __init__(self, *args, **kwargs):
-        super().__init__(*args, **kwargs)
 
     @param.depends('ortho_viewer.z_viewer.slice_id',
                    'ortho_viewer.y_viewer.slice_id',
@@ -537,6 +530,136 @@ class OrthoSegmentationDashBoard(BaseImageDashBoard):
 
     def panel(self):
         return pn.Row(self._rebuild_panel)
+
+
+class OrthoAnnotationDashBoard(OrthoSegmentationDashBoard):
+
+    annot_channel = param.Parameter(doc='id of annotation channel')
+    z_freehand_editor = param.Parameter(FreehandEditor())
+    y_freehand_editor = param.Parameter(FreehandEditor())
+    x_freehand_editor = param.Parameter(FreehandEditor())
+    old_subdf = param.DataFrame()
+
+    def _make_dataset(self, key, img):
+        if key == self.annot_channel:
+            annot_dataset = EditableHvDataset(img=img,
+                                              label=self.index_to_str(key),
+                                              spacing=self.spacing)
+            # force reset drawing tool axis
+            self.z_freehand_editor = FreehandEditor(
+                dataset=annot_dataset, slicer=self.ortho_viewer.z_viewer)
+            self.y_freehand_editor = FreehandEditor(
+                dataset=annot_dataset, slicer=self.ortho_viewer.y_viewer)
+            self.x_freehand_editor = FreehandEditor(
+                dataset=annot_dataset,
+                slicer=self.ortho_viewer.x_viewer,
+                swap_axes=True)
+
+            return annot_dataset
+        else:
+            return HvDataset(img=img,
+                             label=self.index_to_str(key),
+                             spacing=self.spacing)
+
+    # NOTE overriding base class --> watch=True not needed (else triggers double update)
+    @param.depends('_dynamic_update_counter')
+    def _dynamic_img_update(self):
+        self.save_annot()
+
+        for hv_ds, img in zip(self.hv_datasets, self.loaded_objects.values()):
+            hv_ds.img = img
+
+    def dmap(self):
+
+        if not self.segmentation_viewer.channel_viewers or self._has_multiselect_changed:
+            selected_channel_config = {
+                key: self.channel_config[key]
+                for key in self.loaded_objects.keys()
+            }
+            self.segmentation_viewer = SegmentationViewer.from_channel_config(
+                selected_channel_config,
+                composite_channels=self.composite_channels,
+                overlay_channels=self.overlay_channels)
+            self._widget_update_counter += 1
+
+        self.hv_datasets = [
+            self._make_dataset(key, img)
+            for key, img in self.loaded_objects.items()
+        ]
+        dmaps = [hv_ds.dmap() for hv_ds in self.hv_datasets]
+
+        dmaps = [self.ortho_viewer(dmap) for dmap in dmaps]
+
+        # invert slices and channels
+        dmaps = list(zip(*dmaps))
+
+        # add crosshair overlay + drawingtool overlay, bug if adding to an existing overlay
+        # NOTE: workaround to overlay drawingtool. does not work if overlayed after Overlay + collate
+        # similar to reported holoviews bug. tap stream attached to a dynamic map does not update
+        # https://github.com/holoviz/holoviews/issues/3533
+        cross = self.ortho_viewer.get_crosshair()
+        freehands = [(self.z_freehand_editor.path_plot, ),
+                     (self.x_freehand_editor.path_plot, ),
+                     (self.y_freehand_editor.path_plot, )]
+        dmaps = [
+            dmap + cr + fh for dmap, cr, fh in zip(dmaps, cross, freehands)
+        ]
+
+        dmaps = [self.segmentation_viewer(dmap) for dmap in dmaps]
+
+        @param.depends(self.z_freehand_editor.param.draw_in_3D, watch=True)
+        def _sync_freehands_3D(draw_in_3D):
+            self.x_freehand_editor.draw_in_3D = draw_in_3D
+            self.y_freehand_editor.draw_in_3D = draw_in_3D
+
+        @param.depends(self.z_freehand_editor.param.tool_width, watch=True)
+        def _sync_freehands_toolsize(tool_width):
+            self.x_freehand_editor.tool_width = tool_width
+            self.y_freehand_editor.tool_width = tool_width
+
+        return dmaps
+
+    def save_annot(self, event=None):
+        npimg = self.z_freehand_editor.dataset.img.astype(np.int16)
+        if npimg.shape != (2, 2) and self.old_subdf is not None:
+            single_index = list(
+                set(self.old_subdf.index.names) -
+                set(self.multi_select_levels))
+            row = self.old_subdf.reset_index(single_index).dc[
+                self.annot_channel]
+            row.dc.write(npimg, compress=9)
+
+    def discard_changes(self, event=None):
+
+        single_index = list(
+            set(self.old_subdf.index.names) - set(self.multi_select_levels))
+        row = self.old_subdf.reset_index(single_index).dc[self.annot_channel]
+        img = row.dc.read()[0]
+
+        self.z_freehand_editor.dataset.img = img
+
+    @param.depends('subdf', watch=True)
+    def _backup_subdf(self):
+        self.old_subdf = self.subdf
+
+    @param.depends('_widget_update_counter')
+    def widgets(self):
+        wg = super().widgets()
+
+        save_button = pn.widgets.Button(name='save')
+        save_button.on_click(self.save_annot)
+
+        discard_button = pn.widgets.Button(name='discard changes')
+        discard_button.on_click(self.discard_changes)
+
+        edit_wg = self.z_freehand_editor.dataset.widgets()
+        edit_wg.append(self.z_freehand_editor.param.tool_width)
+        edit_wg.append(self.z_freehand_editor.param.draw_in_3D)
+        edit_wg.append(save_button)
+        edit_wg.append(discard_button)
+
+        return pn.Column(self.io_widgets, self.segmentation_viewer.widgets,
+                         edit_wg)
 
 
 class ScatterDashBoard(MultiCollectionHandler, param.Parameterized):
