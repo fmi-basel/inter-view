@@ -6,9 +6,8 @@ contrib = [
 
 # setup.
 setup(name='inter_view',
-      version='0.2.1',
-      description=
-      'Utils to interactively visualize pre-computed dataframe with bokeh',
+      version='0.3',
+      description='Interactive visualization of bio-imaging data',
       author=', '.join(contrib),
       packages=find_packages(exclude=[
           'tests',
@@ -22,5 +21,13 @@ setup(name='inter_view',
           'Pillow>=6.0.0',
           'opencv-python>=4.1',
           'scikit-image',
+          'holoviews',
+          'panel',
+          'param',
+          'xarray',
+          'datashader',
+          'scipy',
+          'imagecodecs',
+          'improc @ git+https://github.com/fmi-basel/improc',
       ],
       zip_safe=False)
