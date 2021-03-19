@@ -98,15 +98,19 @@ class HvDataset(param.Parameterized):
 def make_composite(imgs, cmaps, mode='max'):
     '''embeds colormap and blend grescale input images into a rgb image'''
 
-    if mode != 'max':
+    _modes = {'max': np.max, 'mean': np.mean}
+
+    blending_fun = _modes.get(mode, None)
+
+    if blending_fun is None:
         raise NotImplementedError(
             'blending mode note implemented: {}'.format(mode))
-    else:
-        blending_fun = np.max
 
     imgs = [(plt.get_cmap(name)(img)[..., :-1] * 255).astype(np.uint8)
             for img, name in zip(imgs, cmaps)]
-    return blending_fun(np.asarray(imgs), axis=0)
+
+    blended_img = blending_fun(np.asarray(imgs), axis=0)
+    return np.rint(blended_img).astype(np.uint8)
 
 
 def blend_overlay(elems):
